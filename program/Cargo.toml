@@ -1,0 +1,29 @@
+[package]
+name = "vcoin-program"
+version = "0.1.0"
+edition = "2021"
+description = "VCoin Token Smart Contract with Token-2022, Presale, and Vesting functionality"
+license = "MIT"
+
+[features]
+no-entrypoint = []
+test-bpf = []
+
+[dependencies]
+borsh = "1.5.6"
+thiserror = "1.0.50"
+solana-program = "1.18.0"
+num-derive = "0.4"
+num-traits = "0.2"
+spl-token = { version = "4.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "1.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "2.2.0", features = ["no-entrypoint"] }
+spl-token-metadata-interface = "0.2.0"
+spl-type-length-value = "0.3.0"
+
+[dev-dependencies]
+solana-program-test = "1.18.0"
+solana-sdk = "1.18.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]

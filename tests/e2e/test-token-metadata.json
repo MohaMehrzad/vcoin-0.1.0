@@ -1,0 +1,9 @@
+{
+  "mintAddress": "7KVJjSF9ZQ7LihvQUu9N7Gqq9P5thxYkDLeaGAriLuH",
+  "authorityAddress": "E9cD41o3WxWL99Pezrqvy2aDU7XJkdaCbbavTxRr9bgK",
+  "name": "VCoin",
+  "symbol": "VCN",
+  "totalSupply": "1000000000",
+  "decimals": 6,
+  "uri": "https://metadata.vcoin.example/metadata.json"
+}

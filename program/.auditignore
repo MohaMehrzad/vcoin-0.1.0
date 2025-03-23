@@ -1,0 +1,24 @@
+# Security audit ignore file
+
+# Unmaintained dependency warnings - these are used by solana-program transitively
+# and we can't upgrade them directly
+RUSTSEC-2024-0388 # derivative is unmaintained; consider using an alternative
+RUSTSEC-2024-0436 # paste - no longer maintained 
+RUSTSEC-2024-0370 # proc-macro-error is unmaintained
+RUSTSEC-2025-0010 # ring prior to 0.17 is unmaintained
+
+# Unsound warnings in transitive dependencies
+RUSTSEC-2021-0145 # atty: Potential unaligned read
+RUSTSEC-2023-0033 # borsh: Parsing borsh messages with ZST which are not-copy/clone is unsound
+
+# Dependencies in Solana that are not directly used
+RUSTSEC-2023-0042 # ouroboros - used by solana-runtime internally, not our contract
+
+# Known compiler warnings that cannot be fixed (internal to Solana macros)
+# These warnings come from the Solana entrypoint! macro's internal cfg attributes
+# and are expected in the current Solana SDK version
+SOLANA-CFG-WARNING-01 # unexpected `cfg` condition value: `custom-heap`
+SOLANA-CFG-WARNING-02 # unexpected `cfg` condition value: `solana`
+SOLANA-CFG-WARNING-03 # unexpected `cfg` condition value: `custom-panic`
+
+# These should be resolved once Solana updates their dependencies in future SDK releases 
