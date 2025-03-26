@@ -30,6 +30,7 @@ out/
 .nuxt/
 .vitepress/dist
 .output/
+.frontend/
 
 # Rust/Solana specific
 target/
