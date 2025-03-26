@@ -8,6 +8,8 @@ import { promisify } from 'util';
 import { createInterface } from 'readline';
 import bs58 from 'bs58';
 import * as naclModule from 'tweetnacl';
+import * as lockfile from 'proper-lockfile';
+import * as fsExtra from 'fs-extra';
 
 // Load environment variables
 dotenv.config();
@@ -369,12 +371,16 @@ export async function getOrCreateKeypair(
         
         // Get password for encryption
         const encryptionPassword = skipPrompt
-          ? (password || process.env.KEYPAIR_PASSWORD || generateRandomPassword())
+          ? (password || process.env.KEYPAIR_PASSWORD || (isProductionEnvironment() ? forceSecurePassword(keyName) : generateRandomPassword()))
           : await getPassword(`Create password to encrypt ${keyName} keypair:`);
           
         if (skipPrompt && !password && !process.env.KEYPAIR_PASSWORD) {
-          console.log(`Generated random password for ${keyName} keypair encryption.`);
-          console.log('WARNING: This is not secure for production use.');
+          if (isProductionEnvironment()) {
+            console.log(`Secure password required for ${keyName} keypair in production environment.`);
+          } else {
+            console.log(`Generated random password for ${keyName} keypair encryption.`);
+            console.log('WARNING: This is not secure for production use.');
+          }
         }
         
         // Encrypt keypair data
@@ -406,20 +412,98 @@ export async function getOrCreateKeypair(
 }
 
 /**
- * Generates a random password of specified length
- * @param {number} length - The length of the password
- * @returns {string} A random password
+ * Checks if the current environment is production
+ * @returns {boolean} True if the environment is production
  */
-function generateRandomPassword(length: number = 16): string {
-  const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+';
+export function isProductionEnvironment(): boolean {
+  return process.env.NODE_ENV === 'production' || 
+         process.env.SOLANA_NETWORK === 'mainnet' || 
+         process.env.SOLANA_NETWORK === 'mainnet-beta';
+}
+
+/**
+ * Forces secure password through environment variables or interactive prompt
+ * @param {string} keyName - The name of the keypair
+ * @returns {string} Secure password from environment or throws an error
+ * @throws {Error} If no secure password is provided in production
+ */
+function forceSecurePassword(keyName: string): string {
+  const envVar = `KEYPAIR_PASSWORD_${keyName.toUpperCase()}`;
+  const fallbackVar = 'KEYPAIR_PASSWORD';
+  
+  // Try to get a specific password for this key first
+  const specificPassword = process.env[envVar];
+  if (specificPassword && specificPassword.length >= 16) {
+    return specificPassword;
+  }
+  
+  // Try the fallback password
+  const fallbackPassword = process.env[fallbackVar];
+  if (fallbackPassword && fallbackPassword.length >= 16) {
+    return fallbackPassword;
+  }
+  
+  // If we reach here, no secure password was found
+  throw new Error(
+    `Production environment requires a secure password for ${keyName} keypair.\n` +
+    `Please set ${envVar} or ${fallbackVar} environment variable with a strong password (minimum 16 characters).`
+  );
+}
+
+/**
+ * Generates a cryptographically secure random password with high entropy
+ * @param {number} length - The length of the password (min 16)
+ * @returns {string} A secure random password
+ */
+function generateRandomPassword(length: number = 24): string {
+  // Enforce minimum length
+  const actualLength = Math.max(length, 16);
+  
+  // Define character sets for different types of characters
+  const lowercase = 'abcdefghijklmnopqrstuvwxyz';
+  const uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const numbers = '0123456789';
+  const symbols = '!@#$%^&*()-_=+[]{}|;:,.<>?';
+  
+  // Ensure we use all character types for better entropy
   let password = '';
   
-  for (let i = 0; i < length; i++) {
-    const randomIndex = crypto.randomInt(0, charset.length);
+  // Add at least one character from each set
+  password += lowercase[crypto.randomInt(0, lowercase.length)];
+  password += uppercase[crypto.randomInt(0, uppercase.length)];
+  password += numbers[crypto.randomInt(0, numbers.length)];
+  password += symbols[crypto.randomInt(0, symbols.length)];
+  
+  // Fill the rest with random characters from all sets
+  const charset = lowercase + uppercase + numbers + symbols;
+  
+  // Generate remaining characters
+  for (let i = password.length; i < actualLength; i++) {
+    const randomBytes = crypto.randomBytes(4);
+    const randomIndex = randomBytes.readUInt32BE(0) % charset.length;
     password += charset[randomIndex];
   }
   
-  return password;
+  // Shuffle the password characters to avoid predictable patterns
+  return shuffleString(password);
+}
+
+/**
+ * Shuffles a string using Fisher-Yates algorithm
+ * @param {string} str - The string to shuffle
+ * @returns {string} Shuffled string
+ */
+function shuffleString(str: string): string {
+  const array = str.split('');
+  
+  // Generate secure random numbers for shuffling
+  for (let i = array.length - 1; i > 0; i--) {
+    const randomBytes = crypto.randomBytes(4);
+    const j = randomBytes.readUInt32BE(0) % (i + 1);
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  
+  return array.join('');
 }
 
 /**
@@ -748,7 +832,7 @@ export function handleError(
   const fullMessage = context ? `[${context}] ${errorMessage}` : errorMessage;
   
   // Different logging based on environment
-  const environment = process.env.NODE_ENV || 'development';
+  const environment = process.env.NODE_ENV === 'development' ? 'development' : 'production';
   
   if (environment === 'production') {
     // In production, log minimal information
@@ -776,5 +860,245 @@ export function handleError(
   // Exit the process if requested
   if (shouldExit) {
     process.exit(1);
+  }
+}
+
+/**
+ * Safe file operations with locking to prevent race conditions
+ */
+
+/**
+ * Safely reads a JSON file with locking to prevent race conditions
+ * 
+ * @param {string} filePath - Path to the file to read
+ * @param {Object} defaultValue - Default value if file doesn't exist
+ * @param {Object} options - Additional options for locking
+ * @returns {Promise<any>} - The file content
+ */
+export async function safeReadJSON<T>(
+  filePath: string, 
+  defaultValue: T, 
+  options: { ensureDir?: boolean, retries?: number } = {}
+): Promise<T> {
+  const { ensureDir = true, retries = 5 } = options;
+  
+  // Create directory if it doesn't exist
+  if (ensureDir) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fsExtra.mkdirSync(dir, { recursive: true, mode: 0o750 }); // Read/write/execute for owner, read/execute for group
+    }
+  }
+  
+  // Return default value if file doesn't exist
+  if (!fs.existsSync(filePath)) {
+    return defaultValue;
+  }
+  
+  try {
+    // Acquire a lock for reading
+    await lockfile.lock(filePath, { 
+      retries, 
+      retryWait: 100, 
+      stale: 30000 
+    });
+    
+    try {
+      const content = await fsExtra.readJSON(filePath);
+      return content as T;
+    } finally {
+      // Always release the lock
+      await lockfile.unlock(filePath);
+    }
+  } catch (error: any) {
+    console.error(`Error reading file with lock: ${filePath}`, error);
+    
+    // If locking fails, try to read without locking as fallback
+    if (fs.existsSync(filePath)) {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as T;
+      } catch (readError) {
+        console.error(`Fallback read also failed: ${filePath}`, readError);
+      }
+    }
+    
+    // Return default value if everything fails
+    return defaultValue;
+  }
+}
+
+/**
+ * Safely writes a JSON file with locking to prevent race conditions
+ * 
+ * @param {string} filePath - Path to the file to write
+ * @param {any} data - Data to write
+ * @param {Object} options - Additional options for locking
+ * @returns {Promise<void>}
+ */
+export async function safeWriteJSON(
+  filePath: string, 
+  data: any, 
+  options: { 
+    ensureDir?: boolean, 
+    retries?: number, 
+    atomic?: boolean,
+    pretty?: boolean
+  } = {}
+): Promise<void> {
+  const { 
+    ensureDir = true, 
+    retries = 5, 
+    atomic = true,
+    pretty = true 
+  } = options;
+  
+  // Create directory if it doesn't exist
+  if (ensureDir) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fsExtra.mkdirSync(dir, { recursive: true, mode: 0o750 }); // Read/write/execute for owner, read/execute for group
+    }
+  }
+  
+  try {
+    // Acquire a lock for writing
+    await lockfile.lock(filePath, { 
+      retries, 
+      retryWait: 100, 
+      stale: 30000 
+    });
+    
+    try {
+      // Write the file atomically to prevent partial writes
+      if (atomic) {
+        await fsExtra.writeJSON(
+          filePath, 
+          data, 
+          { 
+            spaces: pretty ? 2 : 0,
+            encoding: 'utf-8',
+            mode: 0o640, // Read/write for owner, read for group
+            flag: 'w' 
+          }
+        );
+      } else {
+        // Direct write if atomic is not required
+        fs.writeFileSync(
+          filePath,
+          JSON.stringify(data, null, pretty ? 2 : 0),
+          { encoding: 'utf-8', mode: 0o640 } // Read/write for owner, read for group
+        );
+      }
+    } finally {
+      // Always release the lock
+      await lockfile.unlock(filePath);
+    }
+  } catch (error: any) {
+    console.error(`Error writing file with lock: ${filePath}`, error);
+    
+    // If locking fails, try to write without locking as fallback
+    // Note: This is not thread-safe, but better than nothing
+    try {
+      if (atomic) {
+        await fsExtra.writeJSON(filePath, data, { spaces: pretty ? 2 : 0 });
+      } else {
+        fs.writeFileSync(filePath, JSON.stringify(data, null, pretty ? 2 : 0), 'utf-8');
+      }
+    } catch (writeError) {
+      console.error(`Fallback write also failed: ${filePath}`, writeError);
+      throw writeError; // Re-throw to indicate failure
+    }
+  }
+}
+
+/**
+ * Safely updates a JSON file with locking to prevent race conditions
+ * This reads the file, applies the update function, and then writes it back
+ * 
+ * @param {string} filePath - Path to the file to update
+ * @param {Function} updateFn - Function that transforms the data
+ * @param {any} defaultValue - Default value if file doesn't exist
+ * @param {Object} options - Additional options for locking
+ * @returns {Promise<T>} - The updated data
+ */
+export async function safeUpdateJSON<T>(
+  filePath: string, 
+  updateFn: (data: T) => T, 
+  defaultValue: T,
+  options: {
+    ensureDir?: boolean, 
+    retries?: number,
+    atomic?: boolean,
+    pretty?: boolean
+  } = {}
+): Promise<T> {
+  const { 
+    ensureDir = true, 
+    retries = 5, 
+    atomic = true,
+    pretty = true 
+  } = options;
+  
+  // Create directory if it doesn't exist
+  if (ensureDir) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fsExtra.mkdirSync(dir, { recursive: true });
+    }
+  }
+  
+  try {
+    // Acquire a lock for reading and writing
+    await lockfile.lock(filePath, { 
+      retries, 
+      retryWait: 100, 
+      stale: 30000 
+    });
+    
+    try {
+      // Read current data or use default
+      let data: T;
+      if (fs.existsSync(filePath)) {
+        try {
+          data = await fsExtra.readJSON(filePath) as T;
+        } catch (readError) {
+          console.warn(`Error reading file for update: ${filePath}`, readError);
+          data = defaultValue;
+        }
+      } else {
+        data = defaultValue;
+      }
+      
+      // Apply update function to transform data
+      const updatedData = updateFn(data);
+      
+      // Write updated data back to file
+      if (atomic) {
+        await fsExtra.writeJSON(
+          filePath, 
+          updatedData, 
+          { 
+            spaces: pretty ? 2 : 0,
+            encoding: 'utf-8',
+            mode: 0o640, // Read/write for owner, read for group
+            flag: 'w' 
+          }
+        );
+      } else {
+        fs.writeFileSync(
+          filePath,
+          JSON.stringify(updatedData, null, pretty ? 2 : 0),
+          { encoding: 'utf-8', mode: 0o640 }
+        );
+      }
+      
+      return updatedData;
+    } finally {
+      // Always release the lock
+      await lockfile.unlock(filePath);
+    }
+  } catch (error: any) {
+    console.error(`Error updating file with lock: ${filePath}`, error);
+    throw new Error(`Failed to update file safely: ${error.message}`);
   }
 } 

@@ -25,12 +25,37 @@ import {
   verifyAuthority,
   PRESALE_PRICE_USD,
   PRESALE_START_DATE,
-  PRESALE_END_DATE
+  PRESALE_END_DATE,
+  safeReadJSON,
+  safeWriteJSON,
+  safeUpdateJSON,
+  handleError,
+  ValidationError,
+  SecurityError,
+  BalanceError,
+  TransactionError,
+  FileOperationError
 } from './utils';
 import axios from 'axios';
 
 // Presale storage file
 const PRESALE_DATA_PATH = path.resolve(process.cwd(), 'presale-data.json');
+
+// Interface for presale data
+export interface PresaleData {
+  isActive: boolean;
+  startTime: string | null;
+  endTime: string | null;
+  totalTokensSold: number;
+  totalUsdRaised: number;
+  participants: Array<{
+    address: string;
+    usdAmount: number;
+    tokenAmount: number;
+    paymentMethod: PaymentMethod;
+    timestamp: string;
+  }>;
+}
 
 // Known token addresses for mainnet-beta
 const TOKEN_ADDRESSES = {
@@ -298,75 +323,94 @@ export async function getCachedUsdToSolRate(): Promise<number> {
   return getCachedRate('SOL');
 }
 
-// Load presale data
-export function loadPresaleData(): any {
-  if (!fs.existsSync(PRESALE_DATA_PATH)) {
-    return {
-      participants: [],
+// Load presale data with thread-safe locking
+export async function loadPresaleData(): Promise<PresaleData> {
+  const defaultData: PresaleData = {
+    isActive: false,
+    startTime: null,
+    endTime: null,
+    totalTokensSold: 0,
+    totalUsdRaised: 0,
+    participants: []
+  };
+  
+  return await safeReadJSON<PresaleData>(PRESALE_DATA_PATH, defaultData);
+}
+
+// Save presale data with thread-safe locking
+export async function savePresaleData(data: PresaleData): Promise<void> {
+  await safeWriteJSON(PRESALE_DATA_PATH, data);
+}
+
+// Check if presale is active
+export async function isPresaleActive(): Promise<boolean> {
+  const presaleData = await loadPresaleData();
+  return presaleData.isActive === true;
+}
+
+// Calculate token amount based on USD
+export function calculateTokensForUsd(usdAmount: number): number {
+  return Math.floor(usdAmount / PRESALE_PRICE_USD);
+}
+
+// Start presale
+export async function startPresale(): Promise<void> {
+  // Update the presale data atomically
+  await safeUpdateJSON<PresaleData>(
+    PRESALE_DATA_PATH,
+    (presaleData) => {
+      if (presaleData.isActive) {
+        console.log('Presale is already active.');
+        return presaleData;
+      }
+      
+      presaleData.isActive = true;
+      presaleData.startTime = new Date().toISOString();
+      presaleData.endTime = null;
+      
+      console.log(`Presale started at ${presaleData.startTime}`);
+      console.log('Token price:', PRESALE_PRICE_USD, 'USD');
+      return presaleData;
+    },
+    {
+      isActive: false,
+      startTime: null,
+      endTime: null,
       totalTokensSold: 0,
       totalUsdRaised: 0,
+      participants: []
+    }
+  );
+}
+
+// End presale
+export async function endPresale(): Promise<void> {
+  // Update the presale data atomically
+  await safeUpdateJSON<PresaleData>(
+    PRESALE_DATA_PATH,
+    (presaleData) => {
+      if (!presaleData.isActive) {
+        console.log('Presale is not active.');
+        return presaleData;
+      }
+      
+      presaleData.isActive = false;
+      presaleData.endTime = new Date().toISOString();
+      
+      console.log(`Presale ended at ${presaleData.endTime}`);
+      console.log(`Total tokens sold: ${presaleData.totalTokensSold}`);
+      console.log(`Total USD raised: ${presaleData.totalUsdRaised}`);
+      return presaleData;
+    },
+    {
       isActive: false,
-    };
-  }
-  return JSON.parse(fs.readFileSync(PRESALE_DATA_PATH, 'utf-8'));
-}
-
-// Save presale data
-export function savePresaleData(data: any): void {
-  fs.writeFileSync(PRESALE_DATA_PATH, JSON.stringify(data, null, 2), 'utf-8');
-}
-
-// Check if presale is currently active
-export function isPresaleActive(): boolean {
-  const now = new Date();
-  return now >= PRESALE_START_DATE && now <= PRESALE_END_DATE;
-}
-
-// Calculate tokens for a given USD amount
-export function calculateTokensForUsd(usdAmount: number): number {
-  return usdAmount / PRESALE_PRICE_USD;
-}
-
-// Start the presale
-export async function startPresale() {
-  const presaleData = loadPresaleData();
-  
-  if (presaleData.isActive) {
-    console.log('Presale is already active.');
-    return;
-  }
-  
-  if (!isPresaleActive()) {
-    console.log('Cannot start presale: Current date is outside the presale date range.');
-    console.log(`Presale window: ${PRESALE_START_DATE.toISOString()} to ${PRESALE_END_DATE.toISOString()}`);
-    return;
-  }
-  
-  presaleData.isActive = true;
-  presaleData.startTime = new Date().toISOString();
-  savePresaleData(presaleData);
-  
-  console.log('Presale has been started successfully!');
-  console.log(`Presale price: $${PRESALE_PRICE_USD} per VCN`);
-  console.log(`Presale window: ${PRESALE_START_DATE.toISOString()} to ${PRESALE_END_DATE.toISOString()}`);
-}
-
-// End the presale
-export async function endPresale() {
-  const presaleData = loadPresaleData();
-  
-  if (!presaleData.isActive) {
-    console.log('Presale is not active.');
-    return;
-  }
-  
-  presaleData.isActive = false;
-  presaleData.endTime = new Date().toISOString();
-  savePresaleData(presaleData);
-  
-  console.log('Presale has been ended.');
-  console.log(`Total tokens sold: ${presaleData.totalTokensSold} VCN`);
-  console.log(`Total USD raised: $${presaleData.totalUsdRaised}`);
+      startTime: null,
+      endTime: null,
+      totalTokensSold: 0,
+      totalUsdRaised: 0,
+      participants: []
+    }
+  );
 }
 
 // Setup rate limiting mechanism
@@ -585,83 +629,121 @@ export async function processPurchase(
   try {
     // Validate inputs
     if (!buyerAddress || typeof buyerAddress !== 'string') {
-      throw new Error('Buyer address is required');
+      throw new ValidationError('Buyer address is required', 'MISSING_BUYER_ADDRESS');
     }
     
     // Validate the buyer address is a valid Solana public key
     let buyerPublicKey: PublicKey;
     try {
       buyerPublicKey = new PublicKey(buyerAddress);
-    } catch (error) {
-      throw new Error(`Invalid Solana address: ${buyerAddress}`);
+    } catch (error: any) {
+      throw new ValidationError(`Invalid Solana address: ${buyerAddress}`, 'INVALID_ADDRESS');
     }
     
     if (!usdAmount || typeof usdAmount !== 'number' || usdAmount <= 0) {
-      throw new Error('USD amount must be a positive number');
+      throw new ValidationError('USD amount must be a positive number', 'INVALID_AMOUNT');
     }
     
     // Validate payment method
     if (!['SOL', 'USDC', 'USDT'].includes(paymentMethod)) {
-      throw new Error(`Unsupported payment method: ${paymentMethod}. Supported methods are SOL, USDC, and USDT.`);
+      throw new ValidationError(
+        `Unsupported payment method: ${paymentMethod}. Supported methods are SOL, USDC, and USDT.`,
+        'UNSUPPORTED_PAYMENT_METHOD'
+      );
     }
     
     // Check rate limits
-    checkRateLimit(buyerAddress, usdAmount);
+    try {
+      checkRateLimit(buyerAddress, usdAmount);
+    } catch (error: any) {
+      throw new SecurityError(`Rate limit error: ${error.message}`, 'RATE_LIMIT_EXCEEDED');
+    }
     
-    // Load presale data
-    const presaleData = loadPresaleData();
+    // Load presale data with locking
+    let presaleData;
+    try {
+      presaleData = await loadPresaleData();
+    } catch (error: any) {
+      throw new FileOperationError(`Failed to load presale data: ${error.message}`, 'PRESALE_DATA_LOAD_FAILED');
+    }
     
     if (!presaleData.isActive) {
-      throw new Error('Presale is not active');
+      throw new ValidationError('Presale is not active', 'PRESALE_INACTIVE');
     }
     
     // Load token metadata
-    const tokenMetadata = loadTokenMetadata();
+    let tokenMetadata;
+    try {
+      tokenMetadata = loadTokenMetadata();
+    } catch (error: any) {
+      throw new FileOperationError(`Failed to load token metadata: ${error.message}`, 'TOKEN_METADATA_LOAD_FAILED');
+    }
     
     // Check presale wallet details
     if (!tokenMetadata.allocations || !tokenMetadata.allocations.presale) {
-      throw new Error('Presale allocation not found in token metadata');
+      throw new ValidationError('Presale allocation not found in token metadata', 'MISSING_PRESALE_ALLOCATION');
     }
     
     const mintAddress = new PublicKey(tokenMetadata.mintAddress);
-    const presaleWalletKeypair = await getOrCreateKeypair('presale_wallet');
+    
+    let presaleWalletKeypair;
+    try {
+      presaleWalletKeypair = await getOrCreateKeypair('presale_wallet');
+    } catch (error: any) {
+      throw new SecurityError(`Failed to load presale wallet: ${error.message}`, 'PRESALE_WALLET_LOAD_FAILED');
+    }
     
     // Get presale token account
-    const presaleTokenAccount = await createAssociatedTokenAccountIdempotent(
-      getConnection(),
-      presaleWalletKeypair,
-      mintAddress,
-      presaleWalletKeypair.publicKey,
-      { commitment: 'confirmed' },
-      TOKEN_2022_PROGRAM_ID
-    );
+    let presaleTokenAccount;
+    try {
+      presaleTokenAccount = await createAssociatedTokenAccountIdempotent(
+        getConnection(),
+        presaleWalletKeypair,
+        mintAddress,
+        presaleWalletKeypair.publicKey,
+        { commitment: 'confirmed' },
+        TOKEN_2022_PROGRAM_ID
+      );
+    } catch (error: any) {
+      throw new TransactionError(`Failed to get presale token account: ${error.message}`, 'TOKEN_ACCOUNT_ERROR');
+    }
     
     // Calculate token amount based on USD amount and token price
     const tokenAmount = Math.floor(usdAmount / PRESALE_PRICE_USD);
     
     if (tokenAmount <= 0) {
-      throw new Error(`USD amount too small. Minimum purchase is ${PRESALE_PRICE_USD} USD`);
+      throw new ValidationError(
+        `USD amount too small. Minimum purchase is ${PRESALE_PRICE_USD} USD`,
+        'AMOUNT_TOO_SMALL'
+      );
     }
     
     // Check remaining allocation
     const remainingTokens = parseInt(tokenMetadata.allocations.presale.amount) - presaleData.totalTokensSold;
     if (tokenAmount > remainingTokens) {
-      throw new Error(`Purchase exceeds remaining allocation. Only ${remainingTokens} tokens available.`);
+      throw new BalanceError(
+        `Purchase exceeds remaining allocation. Only ${remainingTokens} tokens available.`,
+        'INSUFFICIENT_ALLOCATION'
+      );
     }
     
     // Process payment based on payment method
     let paymentSuccess = false;
     
-    if (paymentMethod === 'SOL') {
-      paymentSuccess = await processSolPayment(presaleWalletKeypair, buyerPublicKey, usdAmount);
-    } else if (paymentMethod === 'USDC' || paymentMethod === 'USDT') {
-      paymentSuccess = await processSplTokenPayment(presaleWalletKeypair, buyerPublicKey, usdAmount, paymentMethod);
-    } else {
-      throw new Error(`Unsupported payment method: ${paymentMethod}`);
+    try {
+      if (paymentMethod === 'SOL') {
+        paymentSuccess = await processSolPayment(presaleWalletKeypair, buyerPublicKey, usdAmount);
+      } else if (paymentMethod === 'USDC' || paymentMethod === 'USDT') {
+        paymentSuccess = await processSplTokenPayment(presaleWalletKeypair, buyerPublicKey, usdAmount, paymentMethod);
+      } else {
+        throw new ValidationError(`Unsupported payment method: ${paymentMethod}`, 'UNSUPPORTED_PAYMENT_METHOD');
+      }
+    } catch (error: any) {
+      throw new TransactionError(`Payment processing failed: ${error.message}`, 'PAYMENT_FAILED');
     }
     
     if (!paymentSuccess) {
-      throw new Error(`Payment processing failed for ${paymentMethod}`);
+      throw new TransactionError(`Payment processing failed for ${paymentMethod}`, 'PAYMENT_FAILED');
     }
     
     // Check if buyer token account exists and create it if not
@@ -738,24 +820,48 @@ export async function processPurchase(
       TOKEN_2022_PROGRAM_ID
     );
     
-    // Update presale data
-    presaleData.participants.push({
-      address: buyerAddress,
-      usdAmount,
-      tokenAmount,
-      paymentMethod, // Add payment method to the record
-      timestamp: new Date().toISOString(),
-    });
-    
-    presaleData.totalTokensSold += tokenAmount;
-    presaleData.totalUsdRaised += usdAmount;
-    savePresaleData(presaleData);
+    // Update presale data with locking to prevent race conditions
+    const updatedPresaleData = await safeUpdateJSON<PresaleData>(
+      PRESALE_DATA_PATH,
+      (currentPresaleData) => {
+        // Verify presale is still active
+        if (!currentPresaleData.isActive) {
+          throw new Error('Presale has ended while processing transaction');
+        }
+        
+        // Check again that we don't exceed allocation with latest data
+        if (!tokenMetadata.allocations || !tokenMetadata.allocations.presale) {
+          throw new Error('Presale allocation not found in token metadata');
+        }
+        
+        const currentRemainingTokens = parseInt(tokenMetadata.allocations.presale.amount) - currentPresaleData.totalTokensSold;
+        if (tokenAmount > currentRemainingTokens) {
+          throw new Error(`Purchase exceeds remaining allocation. Only ${currentRemainingTokens} tokens available.`);
+        }
+        
+        // Add the new participant record
+        currentPresaleData.participants.push({
+          address: buyerAddress,
+          usdAmount,
+          tokenAmount,
+          paymentMethod,
+          timestamp: new Date().toISOString(),
+        });
+        
+        // Update totals
+        currentPresaleData.totalTokensSold += tokenAmount;
+        currentPresaleData.totalUsdRaised += usdAmount;
+        
+        return currentPresaleData;
+      },
+      presaleData
+    );
     
     console.log('Purchase processed successfully!');
     console.log(`${tokenAmount} VCN transferred to ${buyerAddress}`);
     console.log(`Payment method: ${paymentMethod}`);
-    console.log(`Total tokens sold: ${presaleData.totalTokensSold} VCN`);
-    console.log(`Total USD raised: $${presaleData.totalUsdRaised}`);
+    console.log(`Total tokens sold: ${updatedPresaleData.totalTokensSold} VCN`);
+    console.log(`Total USD raised: $${updatedPresaleData.totalUsdRaised}`);
     
     // After successful purchase
     recordSuccessfulPurchase(buyerAddress);
@@ -767,68 +873,90 @@ export async function processPurchase(
       paymentMethod,
       timestamp: new Date().toISOString(),
     };
-  } catch (error) {
-    console.error('Error processing purchase:', error);
+  } catch (error: any) {
+    handleError(error, false, 'presale:processPurchase');
     throw error;
   }
 }
 
 // Check presale status
-export function checkPresaleStatus() {
-  const presaleData = loadPresaleData();
-  const now = new Date();
-  
-  console.log('===== VCoin Presale Status =====');
-  console.log(`Status: ${presaleData.isActive ? 'Active' : 'Inactive'}`);
-  console.log(`Start date: ${PRESALE_START_DATE.toISOString()}`);
-  console.log(`End date: ${PRESALE_END_DATE.toISOString()}`);
-  console.log(`Price per token: $${PRESALE_PRICE_USD}`);
-  console.log(`Total tokens sold: ${presaleData.totalTokensSold}`);
-  console.log(`Total USD raised: $${presaleData.totalUsdRaised}`);
-  console.log(`Number of participants: ${presaleData.participants.length}`);
-  console.log(`Payment methods: SOL, USDC, USDT`);
-  console.log('================================');
+export async function checkPresaleStatus(): Promise<void> {
+  try {
+    const presaleData = await loadPresaleData();
+    const now = new Date();
+    
+    console.log('\n===== VCoin Presale Status =====');
+    console.log(`Status: ${presaleData.isActive ? 'ACTIVE' : 'INACTIVE'}`);
+    
+    if (presaleData.startTime) {
+      console.log(`Started: ${new Date(presaleData.startTime).toLocaleString()}`);
+    }
+    
+    if (presaleData.endTime) {
+      console.log(`Ended: ${new Date(presaleData.endTime).toLocaleString()}`);
+    }
+    
+    console.log(`Total Tokens Sold: ${presaleData.totalTokensSold}`);
+    console.log(`Total USD Raised: $${presaleData.totalUsdRaised}`);
+    console.log(`Participants: ${presaleData.participants.length}`);
+    console.log('================================');
+  } catch (error: any) {
+    handleError(error, false, 'presale:checkPresaleStatus');
+  }
 }
 
-// Command line interface
+// Main function
 export async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0];
-  
   try {
+    const args = process.argv.slice(2);
+    const command = args[0];
+    
+    if (!command) {
+      console.log('Available commands:');
+      console.log('  npm run presale start - Start the presale');
+      console.log('  npm run presale end - End the presale');
+      console.log('  npm run presale status - Check presale status');
+      console.log('  npm run presale buy <address> <usd_amount> [payment_method] - Process a purchase');
+      return;
+    }
+    
     switch (command) {
       case 'start':
         await startPresale();
         break;
+        
       case 'end':
         await endPresale();
         break;
+        
+      case 'status':
+        await checkPresaleStatus();
+        break;
+        
       case 'buy':
         if (args.length < 3) {
-          console.error('Usage: npm run presale buy <buyer_address> <usd_amount> [payment_method]');
-          console.error('Supported payment methods: SOL (default), USDC, USDT');
-          process.exit(1);
+          throw new ValidationError(
+            'Usage: npm run presale buy <address> <usd_amount> [payment_method]',
+            'MISSING_ARGUMENTS'
+          );
         }
+        
         const buyerAddress = args[1];
         const usdAmount = parseFloat(args[2]);
-        const paymentMethod = (args[3] || 'SOL').toUpperCase() as PaymentMethod;
+        const paymentMethod = args[3] as PaymentMethod || 'SOL';
+        
+        if (isNaN(usdAmount) || usdAmount <= 0) {
+          throw new ValidationError('USD amount must be a positive number', 'INVALID_AMOUNT');
+        }
+        
         await processPurchase(buyerAddress, usdAmount, paymentMethod);
         break;
-      case 'status':
-        checkPresaleStatus();
-        break;
+        
       default:
-        console.log('Available commands:');
-        console.log('  npm run presale start - Start the presale');
-        console.log('  npm run presale end - End the presale');
-        console.log('  npm run presale buy <buyer_address> <usd_amount> [payment_method] - Process a purchase');
-        console.log('     Supported payment methods: SOL (default), USDC, USDT');
-        console.log('  npm run presale status - Check presale status');
-        break;
+        throw new ValidationError(`Unknown command: ${command}`, 'UNKNOWN_COMMAND');
     }
-  } catch (error) {
-    console.error('Error:', error);
-    process.exit(1);
+  } catch (error: any) {
+    handleError(error, true, 'presale:main');
   }
 }
 

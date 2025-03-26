@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 // Import the functions we want to test
-import { loadTokenMetadata, getOrCreateKeypair } from '../src/utils';
+import { loadTokenMetadata, getOrCreateKeypair, verifyAuthority } from '../src/utils';
 
 // Simulation mode - no actual blockchain transactions
 const SIMULATION_MODE = true;
@@ -28,16 +28,11 @@ async function simulateMetadataUpdate() {
   console.log(`   Authority address: ${authorityAddress.toString()}`);
   
   // Get authority keypair
-  const authorityKeypair = getOrCreateKeypair('authority');
+  const authorityKeypair = await getOrCreateKeypair('authority');
   console.log(`   Authority public key: ${authorityKeypair.publicKey.toString()}`);
   
-  // Verify authority matches
-  if (!authorityKeypair.publicKey.equals(authorityAddress)) {
-    console.error('❌ Error: Authority mismatch');
-    console.error(`   Expected: ${authorityAddress.toString()}`);
-    console.error(`   Actual: ${authorityKeypair.publicKey.toString()}`);
-    process.exit(1);
-  }
+  // Verify authority using standardized function
+  verifyAuthority(authorityKeypair.publicKey, authorityAddress, 'simulate metadata update');
   
   console.log('   Authority verified ✓');
   

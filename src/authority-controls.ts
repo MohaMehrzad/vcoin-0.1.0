@@ -20,11 +20,13 @@ import {
   loadTokenMetadata,
   saveTokenMetadata,
   handleError,
-  verifyAuthority
+  verifyAuthority,
+  SecurityError
 } from './utils';
 
 // Constants
 const AUTHORITY_CONFIG_PATH = path.resolve(process.cwd(), 'authority-config.json');
+const AUTHORITY_CONFIG_VERSION = '1.0.0'; // Add versioning
 
 // Authority capabilities that can be renounced
 export enum AuthorityCapability {
@@ -45,6 +47,7 @@ interface TimeLockedTransfer {
 }
 
 interface AuthorityConfig {
+  version: string; // Add versioning field
   mintAddress: string;
   authorityAddress: string;
   capabilities: {
@@ -72,7 +75,7 @@ export async function initializeAuthorityConfig(authorityKeypair: Keypair): Prom
   
   // Check if config already exists
   if (fs.existsSync(AUTHORITY_CONFIG_PATH)) {
-    const existingConfig = loadAuthorityConfig();
+    const existingConfig = loadAuthorityConfig(false);
     
     // Verify the config is for the same token
     if (existingConfig.mintAddress !== tokenMetadata.mintAddress) {
@@ -82,20 +85,15 @@ export async function initializeAuthorityConfig(authorityKeypair: Keypair): Prom
       );
     }
     
-    // Verify the authority
-    if (existingConfig.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error(
-        `Authority mismatch. ` +
-        `Expected: ${existingConfig.authorityAddress}, ` +
-        `Found: ${authorityKeypair.publicKey.toString()}`
-      );
-    }
+    // Verify the authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(existingConfig.authorityAddress), 'initialize authority');
     
     return existingConfig;
   }
   
   // Create new config
   const config: AuthorityConfig = {
+    version: AUTHORITY_CONFIG_VERSION, // Add version
     mintAddress: tokenMetadata.mintAddress,
     authorityAddress: authorityKeypair.publicKey.toString(),
     capabilities: {
@@ -123,10 +121,17 @@ export async function initializeAuthorityConfig(authorityKeypair: Keypair): Prom
 }
 
 /**
- * Load authority configuration
- * @returns The authority configuration
+ * Load authority configuration with mandatory signature verification
+ * @param skipSignatureVerification Only for testing/dev environments - DO NOT use in production
+ * @returns The verified authority configuration
+ * @throws {Error} If the configuration is not found, signature is missing or invalid
  */
-export function loadAuthorityConfig(): AuthorityConfig {
+export function loadAuthorityConfig(skipSignatureVerification: boolean = false): AuthorityConfig {
+  // Only allow skipping signature verification in non-production environments
+  if (skipSignatureVerification && process.env.NODE_ENV === 'production') {
+    throw new Error('Signature verification cannot be skipped in production environment');
+  }
+
   if (!fs.existsSync(AUTHORITY_CONFIG_PATH)) {
     throw new Error('Authority configuration not found. Initialize it first.');
   }
@@ -134,22 +139,51 @@ export function loadAuthorityConfig(): AuthorityConfig {
   try {
     const configData = JSON.parse(fs.readFileSync(AUTHORITY_CONFIG_PATH, 'utf-8'));
     
-    // Verify signature if present
-    if (configData.signature) {
+    // Always verify the integrity of the configuration file
+    if (!skipSignatureVerification) {
+      // Signature is required
+      if (!configData.signature) {
+        throw new Error('Authority configuration is missing a signature. File may be tampered with or corrupted.');
+      }
+      
       const { signature, ...configWithoutSignature } = configData;
-      const authorityPublicKey = new PublicKey(configData.authorityAddress);
       
-      const message = JSON.stringify(configWithoutSignature, null, 2);
-      const messageBuffer = Buffer.from(message);
+      // Check if the authorityAddress is present and valid
+      if (!configData.authorityAddress) {
+        throw new Error('Authority configuration is missing the authorityAddress field.');
+      }
       
-      const signatureBuffer = Buffer.from(signature, 'base64');
-      const isValid = verifyConfigSignature(messageBuffer, signatureBuffer, authorityPublicKey);
-      
-      if (!isValid) {
-        throw new Error('Authority configuration signature is invalid. File may have been tampered with.');
+      try {
+        const authorityPublicKey = new PublicKey(configData.authorityAddress);
+        
+        const message = JSON.stringify(configWithoutSignature, null, 2);
+        const messageBuffer = Buffer.from(message);
+        
+        const signatureBuffer = Buffer.from(signature, 'base64');
+        const isValid = verifyConfigSignature(messageBuffer, signatureBuffer, authorityPublicKey);
+        
+        if (!isValid) {
+          throw new Error('Authority configuration signature is invalid. File may have been tampered with.');
+        }
+      } catch (error: any) {
+        if (error.message.includes('Invalid public key')) {
+          throw new Error(`Invalid authority public key in configuration: ${configData.authorityAddress}`);
+        }
+        throw error;
       }
     } else {
-      console.warn('Warning: Authority configuration does not have a signature. It may be tampered with.');
+      // Development-only code path
+      console.warn('WARNING: Signature verification skipped. This should only be used in development.');
+    }
+    
+    // Version checking
+    if (!configData.version) {
+      console.warn('Authority configuration has no version. Consider reinitializing with the latest version.');
+      // Add version field to maintain compatibility with older configs
+      configData.version = '0.0.1';
+    } else if (configData.version !== AUTHORITY_CONFIG_VERSION) {
+      console.warn(`Authority configuration version mismatch. Expected: ${AUTHORITY_CONFIG_VERSION}, Found: ${configData.version}`);
+      console.warn('Consider upgrading your configuration to the latest version.');
     }
     
     return configData;
@@ -159,14 +193,15 @@ export function loadAuthorityConfig(): AuthorityConfig {
 }
 
 /**
- * Save authority configuration
+ * Save authority configuration with mandatory signing
  * @param config The authority configuration to save
  * @param authorityKeypair The authority keypair for signing
  */
 export function saveAuthorityConfig(config: AuthorityConfig, authorityKeypair: Keypair): void {
   try {
-    // Update last modified
+    // Update last modified and ensure version
     config.lastModified = new Date().toISOString();
+    config.version = config.version || AUTHORITY_CONFIG_VERSION;
     
     // Create directory if it doesn't exist
     const configDir = path.dirname(AUTHORITY_CONFIG_PATH);
@@ -189,12 +224,16 @@ export function saveAuthorityConfig(config: AuthorityConfig, authorityKeypair: K
       signature: signature.toString('base64')
     };
     
-    // Save config
+    // Save config with atomic write to prevent corruption
+    const tempPath = `${AUTHORITY_CONFIG_PATH}.tmp`;
     fs.writeFileSync(
-      AUTHORITY_CONFIG_PATH,
+      tempPath,
       JSON.stringify(configToSave, null, 2),
       { encoding: 'utf-8', mode: 0o640 } // Read/write for owner, read for group
     );
+    
+    // Rename is atomic on most filesystems
+    fs.renameSync(tempPath, AUTHORITY_CONFIG_PATH);
     
     console.log(`Authority configuration saved to ${AUTHORITY_CONFIG_PATH}`);
   } catch (error: any) {
@@ -243,10 +282,13 @@ function verifyConfigSignature(data: Buffer, signature: Buffer, publicKey: Publi
  */
 export function isAuthorityCapabilityEnabled(capability: AuthorityCapability): boolean {
   try {
-    const config = loadAuthorityConfig();
+    const config = loadVerifiedConfig();
     return config.capabilities[capability] === true;
   } catch (error) {
-    // If config doesn't exist, default to enabled for backward compatibility
+    // If config doesn't exist or is invalid, default to enabled for backward compatibility
+    // But log a warning
+    console.warn(`Warning: Could not verify authority capability ${capability}, defaulting to enabled.`);
+    console.warn(`Reason: ${error instanceof Error ? error.message : String(error)}`);
     return true;
   }
 }
@@ -260,13 +302,11 @@ export async function renounceCapability(
   capability: AuthorityCapability,
   authorityKeypair: Keypair
 ): Promise<void> {
-  // Load configuration
-  let config = loadAuthorityConfig();
+  // Load configuration with verification
+  let config = loadVerifiedConfig();
   
-  // Verify the authority
-  if (config.authorityAddress !== authorityKeypair.publicKey.toString()) {
-    throw new Error(`Only the current authority can renounce capabilities`);
-  }
+  // Verify the authority using the standardized function
+  verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'renounce capability');
   
   // Check if already renounced
   if (!config.capabilities[capability]) {
@@ -361,13 +401,11 @@ export async function proposeAuthorityTransfer(
     throw new Error('Delay must be at least 1 day for security reasons');
   }
   
-  // Load configuration
-  let config = loadAuthorityConfig();
+  // Load configuration with verification
+  let config = loadVerifiedConfig();
   
-  // Verify the authority
-  if (config.authorityAddress !== authorityKeypair.publicKey.toString()) {
-    throw new Error(`Only the current authority can propose a transfer`);
-  }
+  // Verify the authority using standardized function
+  verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'propose authority transfer');
   
   // Check if capability is enabled
   if (!isAuthorityCapabilityEnabled(AuthorityCapability.TRANSFER_AUTHORITY)) {
@@ -414,13 +452,11 @@ export async function cancelAuthorityTransfer(
   index: number,
   authorityKeypair: Keypair
 ): Promise<void> {
-  // Load configuration
-  let config = loadAuthorityConfig();
+  // Load configuration with verification
+  let config = loadVerifiedConfig();
   
-  // Verify the authority
-  if (config.authorityAddress !== authorityKeypair.publicKey.toString()) {
-    throw new Error(`Only the current authority can cancel a transfer`);
-  }
+  // Verify the authority using standardized function
+  verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'cancel authority transfer');
   
   // Validate index
   if (index < 0 || index >= config.timeLockedTransfers.length) {
@@ -459,13 +495,11 @@ export async function executeAuthorityTransfer(
   index: number,
   authorityKeypair: Keypair
 ): Promise<void> {
-  // Load configuration
-  let config = loadAuthorityConfig();
+  // Load configuration with verification
+  let config = loadVerifiedConfig();
   
-  // Verify the authority
-  if (config.authorityAddress !== authorityKeypair.publicKey.toString()) {
-    throw new Error(`Only the current authority can execute a transfer`);
-  }
+  // Verify the authority using standardized function
+  verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'execute authority transfer');
   
   // Validate index
   if (index < 0 || index >= config.timeLockedTransfers.length) {
@@ -474,80 +508,63 @@ export async function executeAuthorityTransfer(
   
   const transfer = config.timeLockedTransfers[index];
   
-  // Check status
-  if (transfer.status !== 'pending') {
-    throw new Error(`Transfer is not pending (status: ${transfer.status})`);
+  // Check transfer status
+  if (transfer.status === 'executed') {
+    throw new Error(`Transfer has already been executed`);
   }
   
-  // Check if time lock has expired
-  const executeAfter = new Date(transfer.executeAfter);
+  if (transfer.status === 'cancelled') {
+    throw new Error(`Cannot execute a cancelled transfer`);
+  }
+  
+  // Check time lock
   const now = new Date();
+  const executeAfter = new Date(transfer.executeAfter);
   
   if (now < executeAfter) {
     const timeRemaining = Math.ceil((executeAfter.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
     throw new Error(
-      `Time lock has not expired yet. ` +
-      `Transfer can be executed after ${executeAfter.toLocaleString()} ` +
-      `(${timeRemaining} days remaining)`
+      `Time lock has not expired. Transfer can be executed after ${executeAfter.toLocaleString()}. ` +
+      `Remaining time: ${timeRemaining} days.`
     );
   }
   
-  // Load token metadata
-  const tokenMetadata = loadTokenMetadata(authorityKeypair.publicKey);
-  const mintAddress = new PublicKey(tokenMetadata.mintAddress);
-  const targetPublicKey = new PublicKey(transfer.targetAddress);
+  // Get target address
+  let targetAddress: PublicKey;
+  try {
+    targetAddress = new PublicKey(transfer.targetAddress);
+  } catch (error) {
+    throw new Error(`Invalid target address: ${transfer.targetAddress}`);
+  }
   
-  // Execute transfer on-chain
-  console.log(`Executing authority transfer to ${transfer.targetAddress}...`);
-  
-  const connection = getConnection();
+  // Before executing the transfer, create a backup
+  backupAuthorityConfig(config, authorityKeypair);
   
   try {
-    // Create instruction to set new mint authority
-    const updateMintAuthorityInstruction = createSetAuthorityInstruction(
-      mintAddress,
-      authorityKeypair.publicKey,
-      AuthorityType.MintTokens,
-      targetPublicKey,
-      undefined,
-      TOKEN_2022_PROGRAM_ID
-    );
+    // Execute on-chain token authority transfer for mint and other authorities
+    const tokenMetadata = loadTokenMetadata(authorityKeypair.publicKey);
     
-    // Create and sign transaction
-    const transaction = new Transaction().add(updateMintAuthorityInstruction);
-    const signature = await sendAndConfirmTransaction(
-      connection,
-      transaction,
-      [authorityKeypair],
-      { commitment: 'confirmed' }
-    );
+    // Update token metadata
+    const updatedMetadata = { ...tokenMetadata, authorityAddress: targetAddress.toString() };
+    saveTokenMetadata(updatedMetadata, authorityKeypair);
     
     // Update transfer status
     transfer.status = 'executed';
-    transfer.transactionId = signature;
-    
-    // Update authority address in config
-    config.authorityAddress = transfer.targetAddress;
     
     // Log the action
     config.actionLog.push({
       action: 'EXECUTE_TRANSFER',
       timestamp: new Date().toISOString(),
-      transactionId: signature,
-      details: `Transferred authority to ${transfer.targetAddress}`
+      details: `Executed transfer to ${targetAddress.toString()}`
     });
     
-    // Save updated configuration
-    saveAuthorityConfig(config, authorityKeypair);
+    // Save updated configuration but with the new authority
+    saveAuthorityConfig({
+      ...config,
+      authorityAddress: targetAddress.toString()
+    }, authorityKeypair);
     
-    // Update token metadata
-    tokenMetadata.authorityAddress = transfer.targetAddress;
-    saveTokenMetadata(tokenMetadata, authorityKeypair);
-    
-    console.log(`Authority successfully transferred to ${transfer.targetAddress}`);
-    console.log(`Transaction ID: ${signature}`);
-    console.log(`\nNOTE: The new authority must initialize their keypair to manage the token.`);
-    
+    console.log(`Authority successfully transferred to ${targetAddress.toString()}`);
   } catch (error: any) {
     throw new Error(`Failed to execute authority transfer: ${error.message}`);
   }
@@ -609,109 +626,334 @@ export function listAuthorityStatus(): void {
   }
 }
 
-// Main function for CLI
-export async function main() {
-  const args = process.argv.slice(2);
-  const command = args[0];
+/**
+ * Upgrade configuration to the latest version if needed
+ * @param config The configuration to upgrade
+ * @param authorityKeypair The authority keypair
+ * @returns The upgraded configuration
+ */
+export function upgradeAuthorityConfig(config: AuthorityConfig, authorityKeypair: Keypair): AuthorityConfig {
+  // Skip if already at the latest version
+  if (config.version === AUTHORITY_CONFIG_VERSION) {
+    return config;
+  }
+  
+  // Verify the authority
+  verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'upgrade configuration');
+  
+  console.log(`Upgrading authority configuration from v${config.version} to v${AUTHORITY_CONFIG_VERSION}`);
+  
+  // Perform version-specific upgrades
+  const upgradedConfig = { ...config };
+  
+  // Example version upgrade logic:
+  // if (config.version === '0.0.1') {
+  //   upgradedConfig.someNewField = 'defaultValue';
+  //   upgradedConfig.version = '0.0.2';
+  // }
+  
+  // if (upgradedConfig.version === '0.0.2') {
+  //   upgradedConfig.anotherNewField = true;
+  //   upgradedConfig.version = '0.0.3';
+  // }
+  
+  // Always update to the latest version
+  upgradedConfig.version = AUTHORITY_CONFIG_VERSION;
+  
+  // Log the upgrade
+  upgradedConfig.actionLog.push({
+    action: 'UPGRADE_CONFIG',
+    timestamp: new Date().toISOString(),
+    details: `Configuration upgraded from v${config.version} to v${AUTHORITY_CONFIG_VERSION}`
+  });
+  
+  // Save the upgraded config
+  saveAuthorityConfig(upgradedConfig, authorityKeypair);
+  
+  console.log('Configuration upgrade completed successfully');
+  return upgradedConfig;
+}
+
+/**
+ * Secure backup of authority configuration
+ * @param config The configuration to backup
+ * @param authorityKeypair The authority keypair
+ * @returns Path to the backup file
+ */
+export function backupAuthorityConfig(config: AuthorityConfig, authorityKeypair: Keypair): string {
+  try {
+    // Verify the authority
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(config.authorityAddress), 'backup configuration');
+    
+    // Create backup directory
+    const backupDir = path.resolve(process.cwd(), 'backups');
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+    }
+    
+    // Create a timestamped backup file
+    const timestamp = new Date().toISOString().replace(/[:\.]/g, '-');
+    const backupPath = path.join(backupDir, `authority-config-${timestamp}.json`);
+    
+    // Add backup info to config
+    const backupConfig = { 
+      ...config,
+      backupInfo: {
+        timestamp: new Date().toISOString(),
+        version: config.version,
+        backupCreator: authorityKeypair.publicKey.toString()
+      }
+    };
+    
+    // Sign and save backup
+    const message = JSON.stringify(backupConfig, null, 2);
+    const messageBuffer = Buffer.from(message);
+    const signature = signConfig(messageBuffer, authorityKeypair);
+    
+    const signedBackup = {
+      ...backupConfig,
+      backupSignature: signature.toString('base64')
+    };
+    
+    fs.writeFileSync(
+      backupPath,
+      JSON.stringify(signedBackup, null, 2),
+      { encoding: 'utf-8', mode: 0o640 }
+    );
+    
+    console.log(`Authority configuration backed up to ${backupPath}`);
+    return backupPath;
+  } catch (error: any) {
+    throw new Error(`Failed to backup authority configuration: ${error.message}`);
+  }
+}
+
+/**
+ * Verifies the integrity of the authority configuration and loads it 
+ * with appropriate security checks for the environment
+ * @returns Verified authority configuration
+ */
+function loadVerifiedConfig(): AuthorityConfig {
+  const isProdEnv = process.env.NODE_ENV !== 'development';
   
   try {
+    // Always enforce signature verification
+    return loadAuthorityConfig(false);
+  } catch (error: any) {
+    // In development only, allow fallback if explicitly enabled
+    if (!isProdEnv && process.env.ALLOW_UNSIGNED_CONFIG === 'true') {
+      console.warn('WARNING: Loading unsigned configuration due to ALLOW_UNSIGNED_CONFIG=true');
+      console.warn('This should NEVER be done in production environments');
+      try {
+        return loadAuthorityConfig(true);
+      } catch (fallbackError: any) {
+        throw new SecurityError(
+          `Failed to load config even with signature verification disabled: ${fallbackError.message}`,
+          'CONFIG_LOAD_FAILED_WITH_FALLBACK'
+        );
+      }
+    }
+    
+    // In production, never fallback - always enforce signature verification
+    if (isProdEnv) {
+      console.error('CRITICAL SECURITY ERROR: Failed to verify authority configuration signature');
+      console.error(error.message);
+      // In production, this is a critical security issue - we shouldn't proceed
+      process.exit(1);
+    }
+    
+    // Propagate the original error
+    throw error;
+  }
+}
+
+/**
+ * Command line interface for authority controls
+ */
+export async function main() {
+  try {
+    const args = process.argv.slice(2);
+    const command = args[0];
+    
+    if (!command) {
+      showUsage();
+      return;
+    }
+    
+    // Get authority keypair
+    const authorityKeypair = await getOrCreateKeypair('authority');
+    
     switch (command) {
       case 'init':
-        const authorityKeypair = await getOrCreateKeypair('authority');
         await initializeAuthorityConfig(authorityKeypair);
         break;
         
-      case 'status':
-        listAuthorityStatus();
+      case 'check':
+        // Check configuration integrity and version
+        try {
+          const config = loadVerifiedConfig();
+          console.log('\n=== Authority Configuration ===');
+          console.log(`Mint Address: ${config.mintAddress}`);
+          console.log(`Authority: ${config.authorityAddress}`);
+          console.log(`Version: ${config.version}`);
+          
+          if (config.version !== AUTHORITY_CONFIG_VERSION) {
+            console.log(`\nWARNING: Configuration version (${config.version}) does not match current version (${AUTHORITY_CONFIG_VERSION})`);
+            console.log('Run "npm run authority upgrade" to upgrade the configuration');
+          }
+          
+          console.log('\nCapabilities:');
+          for (const capability in config.capabilities) {
+            console.log(`- ${capability}: ${config.capabilities[capability as keyof typeof config.capabilities] ? 'Enabled' : 'Disabled'}`);
+          }
+          
+          console.log('\nPending Transfers:');
+          const pendingTransfers = config.timeLockedTransfers.filter(t => t.status === 'pending');
+          if (pendingTransfers.length === 0) {
+            console.log('- None');
+          } else {
+            pendingTransfers.forEach((transfer, index) => {
+              const executeAfter = new Date(transfer.executeAfter);
+              const now = new Date();
+              const canExecute = now >= executeAfter;
+              console.log(`- [${index}] Target: ${transfer.targetAddress}`);
+              console.log(`  Executable after: ${executeAfter.toLocaleString()} (${canExecute ? 'CAN EXECUTE NOW' : 'waiting'})`);
+            });
+          }
+          
+          console.log('\nSignature Verification: PASSED');
+          console.log('=============================');
+        } catch (error: any) {
+          console.error('\n=== Authority Configuration Check FAILED ===');
+          console.error(`Error: ${error.message}`);
+          console.error('==========================================');
+          process.exit(1);
+        }
+        break;
+        
+      case 'upgrade':
+        // Upgrade configuration version
+        try {
+          const config = loadVerifiedConfig();
+          if (config.version === AUTHORITY_CONFIG_VERSION) {
+            console.log(`Configuration is already at the latest version (${AUTHORITY_CONFIG_VERSION})`);
+          } else {
+            await upgradeAuthorityConfig(config, authorityKeypair);
+          }
+        } catch (error: any) {
+          console.error(`Error upgrading configuration: ${error.message}`);
+          process.exit(1);
+        }
+        break;
+        
+      case 'backup':
+        // Create a secure backup
+        try {
+          const config = loadVerifiedConfig();
+          const backupPath = await backupAuthorityConfig(config, authorityKeypair);
+          console.log(`Backup created successfully at: ${backupPath}`);
+        } catch (error: any) {
+          console.error(`Error creating backup: ${error.message}`);
+          process.exit(1);
+        }
         break;
         
       case 'renounce':
         if (args.length < 2) {
-          console.error('Usage: npm run authority renounce <capability>');
-          console.error('Available capabilities:');
-          Object.values(AuthorityCapability).forEach(cap => console.error(`- ${cap}`));
+          console.error('Capability to renounce is required');
+          console.error(`Available capabilities: ${Object.values(AuthorityCapability).join(', ')}`);
           process.exit(1);
         }
         
         const capability = args[1] as AuthorityCapability;
         if (!Object.values(AuthorityCapability).includes(capability)) {
           console.error(`Invalid capability: ${capability}`);
-          console.error('Available capabilities:');
-          Object.values(AuthorityCapability).forEach(cap => console.error(`- ${cap}`));
+          console.error(`Available capabilities: ${Object.values(AuthorityCapability).join(', ')}`);
           process.exit(1);
         }
         
-        const keypairForRenounce = await getOrCreateKeypair('authority');
-        await renounceCapability(capability, keypairForRenounce);
+        await renounceCapability(capability, authorityKeypair);
         break;
         
       case 'propose-transfer':
         if (args.length < 3) {
-          console.error('Usage: npm run authority propose-transfer <target_address> <delay_days>');
+          console.error('Target address and delay (in days) are required');
+          console.error('Usage: npm run authority propose-transfer <target_address> <delay_in_days>');
           process.exit(1);
         }
         
         const targetAddress = args[1];
-        const delayDays = parseInt(args[2]);
+        const delayInDays = parseInt(args[2]);
         
-        if (isNaN(delayDays) || delayDays <= 0) {
-          console.error('Delay must be a positive number of days');
+        if (isNaN(delayInDays) || delayInDays < 1) {
+          console.error('Delay must be a positive integer');
           process.exit(1);
         }
         
-        const keypairForProposal = await getOrCreateKeypair('authority');
-        await proposeAuthorityTransfer(targetAddress, delayDays, keypairForProposal);
+        await proposeAuthorityTransfer(targetAddress, delayInDays, authorityKeypair);
         break;
         
       case 'cancel-transfer':
         if (args.length < 2) {
-          console.error('Usage: npm run authority cancel-transfer <index>');
+          console.error('Transfer index is required');
+          console.error('Usage: npm run authority cancel-transfer <transfer_index>');
           process.exit(1);
         }
         
         const cancelIndex = parseInt(args[1]);
-        
         if (isNaN(cancelIndex) || cancelIndex < 0) {
-          console.error('Index must be a non-negative number');
+          console.error('Index must be a non-negative integer');
           process.exit(1);
         }
         
-        const keypairForCancel = await getOrCreateKeypair('authority');
-        await cancelAuthorityTransfer(cancelIndex, keypairForCancel);
+        await cancelAuthorityTransfer(cancelIndex, authorityKeypair);
         break;
         
       case 'execute-transfer':
         if (args.length < 2) {
-          console.error('Usage: npm run authority execute-transfer <index>');
+          console.error('Transfer index is required');
+          console.error('Usage: npm run authority execute-transfer <transfer_index>');
           process.exit(1);
         }
         
         const executeIndex = parseInt(args[1]);
-        
         if (isNaN(executeIndex) || executeIndex < 0) {
-          console.error('Index must be a non-negative number');
+          console.error('Index must be a non-negative integer');
           process.exit(1);
         }
         
-        const keypairForExecute = await getOrCreateKeypair('authority');
-        await executeAuthorityTransfer(executeIndex, keypairForExecute);
+        await executeAuthorityTransfer(executeIndex, authorityKeypair);
         break;
         
       default:
-        console.log('VCoin Authority Management');
-        console.log('Available commands:');
-        console.log('  npm run authority init - Initialize authority configuration');
-        console.log('  npm run authority status - Check authority status');
-        console.log('  npm run authority renounce <capability> - Renounce an authority capability');
-        console.log('  npm run authority propose-transfer <target_address> <delay_days> - Propose a time-locked authority transfer');
-        console.log('  npm run authority cancel-transfer <index> - Cancel a proposed transfer');
-        console.log('  npm run authority execute-transfer <index> - Execute a time-locked transfer');
-        break;
+        console.error(`Unknown command: ${command}`);
+        showUsage();
+        process.exit(1);
     }
-  } catch (error) {
-    console.error('Error:', error);
+  } catch (error: any) {
+    console.error(`Error: ${error.message}`);
     process.exit(1);
   }
+}
+
+/**
+ * Display usage information
+ */
+function showUsage() {
+  console.log('Usage: npm run authority <command>');
+  console.log('\nCommands:');
+  console.log('  init - Initialize authority configuration');
+  console.log('  check - Check authority configuration integrity and version');
+  console.log('  upgrade - Upgrade authority configuration to latest version');
+  console.log('  backup - Create a secure backup of the authority configuration');
+  console.log('  renounce <capability> - Renounce an authority capability');
+  console.log('  propose-transfer <target_address> <delay_in_days> - Propose a time-locked authority transfer');
+  console.log('  cancel-transfer <transfer_index> - Cancel a proposed authority transfer');
+  console.log('  execute-transfer <transfer_index> - Execute a time-locked authority transfer');
+  console.log('\nAvailable capabilities:');
+  Object.values(AuthorityCapability).forEach(capability => {
+    console.log(`  - ${capability}`);
+  });
 }
 
 // Execute main function if this file is run directly

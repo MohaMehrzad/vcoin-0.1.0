@@ -1,0 +1,166 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 255, 255, 255;
+  --background-start-rgb: 10, 15, 30;
+  --background-end-rgb: 5, 10, 25;
+  
+  /* Main accent colors - emphasizing teal/cyan */
+  --accent-magenta: 230, 50, 180;  /* Bright magenta/purple */
+  --accent-purple: 160, 40, 200;   /* Deeper purple */
+  --accent-cyan: 20, 220, 240;     /* Bright teal/cyan - more prominent */
+  --accent-teal: 0, 180, 200;      /* Darker teal */
+  --neon-glow: 0 0 15px;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: 
+    /* Circuit pattern overlay - more subtle and minimal */
+    linear-gradient(to right, rgba(var(--accent-cyan), 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(var(--accent-cyan), 0.02) 1px, transparent 1px),
+    /* Base gradient */
+    linear-gradient(135deg, rgb(var(--background-start-rgb)), rgb(var(--background-end-rgb)));
+  background-size: 50px 50px, 50px 50px, 100% 100%;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-weight: 400;
+}
+
+/* Futuristic UI Elements */
+.btn-futuristic {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 0.75rem 1.5rem;
+  background: linear-gradient(45deg, rgba(var(--accent-cyan), 0.8), rgba(var(--accent-teal), 0.8));
+  border-radius: 4px;
+  border: 1px solid rgba(var(--accent-cyan), 0.3);
+  transition: all 300ms;
+  text-align: center;
+  box-shadow: 0 0 15px rgba(var(--accent-cyan), 0.3);
+  cursor: pointer;
+}
+
+.btn-futuristic:hover {
+  box-shadow: 0 0 25px rgba(var(--accent-cyan), 0.5);
+  border-color: rgba(var(--accent-cyan), 0.8);
+  transform: translateY(-2px);
+}
+
+.btn-futuristic::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: linear-gradient(
+    transparent, 
+    transparent, 
+    transparent, 
+    rgba(var(--accent-cyan), 0.3)
+  );
+  transform: rotate(45deg);
+  animation: shine 5s infinite linear;
+}
+
+/* Tech Circles - Rotating rings */
+.tech-circle {
+  border: 1px solid rgba(var(--accent-cyan), 0.2);
+  border-radius: 50%;
+  animation: rotate 20s infinite linear;
+  box-shadow: 0 0 30px rgba(var(--accent-cyan), 0.05);
+}
+
+.tech-circle:nth-child(2) {
+  border: 1px solid rgba(var(--accent-magenta), 0.2);
+  animation-direction: reverse;
+  animation-duration: 25s;
+}
+
+.tech-circle:nth-child(3) {
+  border: 1px dashed rgba(var(--accent-cyan), 0.1);
+  animation-duration: 30s;
+}
+
+/* Card styling */
+.card-futuristic {
+  background: rgba(20, 25, 40, 0.5);
+  border-radius: 8px;
+  backdrop-filter: blur(15px);
+  border: 1px solid rgba(var(--accent-cyan), 0.1);
+  overflow: hidden;
+  position: relative;
+  transition: all 0.3s ease;
+}
+
+.card-futuristic:hover {
+  box-shadow: 0 0 20px rgba(var(--accent-cyan), 0.2);
+  border-color: rgba(var(--accent-cyan), 0.3);
+  transform: translateY(-2px);
+}
+
+/* Text glow effect */
+.glow-text {
+  text-shadow: 0 0 8px rgba(var(--accent-cyan), 0.5);
+}
+
+/* Form elements */
+input, select, textarea {
+  background: rgba(15, 20, 35, 0.5);
+  border: 1px solid rgba(var(--accent-cyan), 0.2);
+  border-radius: 4px;
+  color: white;
+  padding: 0.5rem 1rem;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  border-color: rgba(var(--accent-cyan), 0.6);
+  box-shadow: 0 0 10px rgba(var(--accent-cyan), 0.2);
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Animations */
+@keyframes shine {
+  0% { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+@keyframes rotate {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  0% { opacity: 0.4; }
+  50% { opacity: 1; }
+  100% { opacity: 0.4; }
+}
+
+/* Minimal scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 20, 35, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--accent-cyan), 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--accent-cyan), 0.5);
+}

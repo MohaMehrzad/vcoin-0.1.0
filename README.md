@@ -183,6 +183,31 @@ Functions:
 - Set fee authority
 - Manage multisig authorities
 
+### Secure Configuration Management
+
+VCoin uses a secure configuration management system to protect critical settings:
+
+```bash
+# Initialize authority configuration
+npm run authority:init
+
+# Check configuration integrity and version
+npm run authority:check
+
+# Upgrade configuration to latest version
+npm run authority:upgrade
+
+# Create secure backup of configuration
+npm run authority:backup
+```
+
+Key security features:
+- **Mandatory signature verification**: All configuration files are cryptographically signed
+- **Version control**: Configuration files include version tracking for safe upgrades
+- **Production safeguards**: Enhanced security checks in production environments
+- **Backup mechanism**: Securely create and restore configuration backups
+- **Role-based access**: Configuration changes require proper authority verification
+
 ## Development
 
 ### Local Development
@@ -360,4 +385,134 @@ This project is licensed under the ISC License - see the [LICENSE](LICENSE) file
 
 **Program ID:** 9ZskGH6R3iVYPeQMf1XiANgDZQHNMUvZgAC8Xxxj7zae
 
-**Contact:** [Your Contact Information] 
+**Contact:** [Your Contact Information]
+
+# VCoin - Production Deployment Guide
+
+This README provides instructions for deploying and running VCoin in a production environment.
+
+## Production Deployment Requirements
+
+1. **Node.js**: Version 16.x or higher
+2. **Solana CLI**: Latest stable version
+3. **Environment**: A secure Linux server with proper firewall configuration
+4. **Network**: Production deployment should target Solana mainnet-beta
+5. **Hardware**: Recommended minimum 4GB RAM, 2 CPU cores, 50GB SSD
+
+## Security Configuration
+
+### Environment Variables
+
+Create a `.env` file with the following required configuration:
+
+```
+# Network Configuration
+SOLANA_NETWORK=mainnet-beta
+NODE_ENV=production
+
+# Security Configuration 
+KEYPAIR_PASSWORD=your-secure-password-minimum-16-chars
+
+# Authority-specific passwords (optional but recommended for multiple keypairs)
+KEYPAIR_PASSWORD_AUTHORITY=your-secure-authority-password
+KEYPAIR_PASSWORD_PRESALE=your-secure-presale-password
+KEYPAIR_PASSWORD_VESTING=your-secure-vesting-password
+```
+
+### File Permissions
+
+Ensure proper file permissions:
+
+```bash
+# Secure the .env file
+chmod 600 .env
+
+# Secure the keypairs directory
+chmod 700 keypairs
+```
+
+## Production Deployment
+
+### 1. Install Dependencies
+
+```bash
+npm install --production
+```
+
+### 2. Build the Application
+
+```bash
+npm run build
+```
+
+### 3. Initialize Authority Configuration
+
+```bash
+npm run authority:init
+```
+
+### 4. Token Creation (if needed)
+
+```bash
+npm run create-token
+```
+
+### 5. Token Allocation (if needed)
+
+```bash
+npm run allocate-token
+```
+
+## Running in Production
+
+All scripts are configured to run in production mode by default. For example:
+
+```bash
+# Start the main application
+npm start
+
+# Run presale operations
+npm run presale [command]
+
+# Manage authority
+npm run authority [command]
+
+# Manage upgrade governance
+npm run upgrade [command]
+```
+
+## Backup Procedures
+
+Regularly back up your configuration files and keypairs:
+
+```bash
+# Back up authority configuration
+npm run authority:backup
+
+# Back up upgrade governance (manually)
+cp upgrade-governance.json upgrade-governance.backup-$(date +%Y%m%d).json
+```
+
+## Security Best Practices
+
+1. **Keypair Security**: Never expose your keypair files. They should be securely encrypted.
+2. **Regular Audits**: Check audit logs regularly to detect unauthorized operations.
+3. **Permission Controls**: Ensure all files maintain secure permissions.
+4. **Multi-Signature**: Use multi-signature operations for critical actions.
+5. **Monitoring**: Implement monitoring for critical operations.
+
+## Troubleshooting Production Issues
+
+If you encounter issues in production:
+
+1. Check log files for errors
+2. Verify environment variables are correctly set
+3. Ensure file permissions are secure
+4. Validate signature verification is working correctly
+5. Confirm network connectivity to Solana
+
+## Contact
+
+For production support, contact:
+- Email: support@vcoin-example.com
+- Security team: security@vcoin-example.com 

@@ -18,6 +18,9 @@ import {
   rawAmountToTokens,
   VESTING_RELEASE_AMOUNT,
   VESTING_RELEASE_INTERVAL_MONTHS,
+  safeReadJSON,
+  safeWriteJSON,
+  safeUpdateJSON
 } from './utils';
 
 // Define interfaces for our data structures
@@ -45,25 +48,23 @@ export interface VestingData {
 // Vesting storage file
 export const VESTING_DATA_PATH = path.resolve(process.cwd(), 'vesting-data.json');
 
-// Load vesting data
-export function loadVestingData(): VestingData {
-  if (!fs.existsSync(VESTING_DATA_PATH)) {
-    // Initial vesting schedule
-    return {
-      mintAddress: '',
-      totalAmount: '0',
-      releases: [],
-      totalReleased: 0,
-      nextReleaseDate: null,
-      initialized: false,
-    };
-  }
-  return JSON.parse(fs.readFileSync(VESTING_DATA_PATH, 'utf-8'));
+// Load vesting data - thread-safe with file locking
+export async function loadVestingData(): Promise<VestingData> {
+  const defaultData = {
+    mintAddress: '',
+    totalAmount: '0',
+    releases: [],
+    totalReleased: 0,
+    nextReleaseDate: null,
+    initialized: false,
+  };
+  
+  return await safeReadJSON<VestingData>(VESTING_DATA_PATH, defaultData);
 }
 
-// Save vesting data
-export function saveVestingData(data: VestingData): void {
-  fs.writeFileSync(VESTING_DATA_PATH, JSON.stringify(data, null, 2), 'utf-8');
+// Save vesting data - thread-safe with file locking
+export async function saveVestingData(data: VestingData): Promise<void> {
+  await safeWriteJSON(VESTING_DATA_PATH, data);
 }
 
 // Initialize vesting schedule based on presale end date
@@ -74,56 +75,77 @@ export async function initializeVesting(): Promise<VestingData> {
     throw new Error('Presale data not found. Run presale first.');
   }
   
-  const presaleData = JSON.parse(fs.readFileSync(PRESALE_DATA_PATH, 'utf-8'));
+  // Use safe read for presale data with proper interface
+  interface PresaleData {
+    endTime?: string;
+    isActive?: boolean;
+    totalTokensSold?: number;
+    totalUsdRaised?: number;
+    participants?: any[];
+  }
+  
+  const presaleData = await safeReadJSON<PresaleData>(PRESALE_DATA_PATH, {});
   
   if (!presaleData.endTime) {
     throw new Error('Presale has not ended yet. End presale first.');
   }
   
   const presaleEndDate = new Date(presaleData.endTime);
-  let vestingData = loadVestingData();
   
-  if (vestingData.initialized) {
-    console.log('Vesting schedule already initialized.');
-    return vestingData;
-  }
-  
-  // Create vesting schedule
-  const firstReleaseDate = new Date(presaleEndDate);
-  
-  // Schedule releases every VESTING_RELEASE_INTERVAL_MONTHS months
-  const totalReleases = Number(VESTING_RELEASE_AMOUNT) === 0 ? 0 : Number(VESTING_RELEASE_AMOUNT) * 7; // 7 releases of 50M each
-  const schedule: VestingRelease[] = [];
-  
-  for (let i = 0; i < 7; i++) {
-    const releaseDate = new Date(firstReleaseDate);
-    releaseDate.setMonth(releaseDate.getMonth() + i * VESTING_RELEASE_INTERVAL_MONTHS);
-    
-    schedule.push({
-      releaseNumber: i + 1,
-      scheduledDate: releaseDate.toISOString(),
-      amount: VESTING_RELEASE_AMOUNT.toString(),
-      executed: false,
-      executionDate: null,
-      transactionId: null,
-      targetWallet: '',
-    });
-  }
-  
-  vestingData = {
-    releases: schedule,
-    totalReleased: 0,
-    nextReleaseDate: schedule[0].scheduledDate,
-    initialized: true,
-    initializedAt: new Date().toISOString(),
-    presaleEndDate: presaleEndDate.toISOString(),
-    mintAddress: '',
-    totalAmount: '',
-  };
-  
-  saveVestingData(vestingData);
-  console.log('Vesting schedule initialized successfully.');
-  return vestingData;
+  // Use safe update to ensure atomic operations
+  return await safeUpdateJSON<VestingData>(
+    VESTING_DATA_PATH,
+    (vestingData) => {
+      if (vestingData.initialized) {
+        console.log('Vesting schedule already initialized.');
+        return vestingData;
+      }
+      
+      // Create vesting schedule
+      const firstReleaseDate = new Date(presaleEndDate);
+      
+      // Schedule releases every VESTING_RELEASE_INTERVAL_MONTHS months
+      const totalReleases = Number(VESTING_RELEASE_AMOUNT) === 0 ? 0 : Number(VESTING_RELEASE_AMOUNT) * 7; // 7 releases of 50M each
+      const schedule: VestingRelease[] = [];
+      
+      for (let i = 0; i < 7; i++) {
+        const releaseDate = new Date(firstReleaseDate);
+        releaseDate.setMonth(releaseDate.getMonth() + i * VESTING_RELEASE_INTERVAL_MONTHS);
+        
+        schedule.push({
+          releaseNumber: i + 1,
+          scheduledDate: releaseDate.toISOString(),
+          amount: VESTING_RELEASE_AMOUNT.toString(),
+          executed: false,
+          executionDate: null,
+          transactionId: null,
+          targetWallet: '',
+        });
+      }
+      
+      const newVestingData = {
+        releases: schedule,
+        totalReleased: 0,
+        nextReleaseDate: schedule[0].scheduledDate,
+        initialized: true,
+        initializedAt: new Date().toISOString(),
+        presaleEndDate: presaleEndDate.toISOString(),
+        mintAddress: '',
+        totalAmount: '',
+      };
+      
+      console.log('Vesting schedule initialized successfully.');
+      return newVestingData;
+    },
+    {
+      mintAddress: '',
+      totalAmount: '0',
+      releases: [],
+      totalReleased: 0,
+      nextReleaseDate: null,
+      initialized: false,
+    }
+  );
 }
 
 /**
@@ -134,8 +156,8 @@ export async function initializeVesting(): Promise<VestingData> {
  */
 export async function executeRelease(releaseNumber: number): Promise<string> {
   try {
-    // Load vesting data
-    const vestingData = loadVestingData();
+    // Load vesting data with locking
+    const vestingData = await loadVestingData();
     
     if (!vestingData.initialized) {
       throw new Error('Vesting schedule not initialized. Run "npm run vesting init" first.');
@@ -269,26 +291,41 @@ export async function executeRelease(releaseNumber: number): Promise<string> {
       TOKEN_2022_PROGRAM_ID
     );
     
-    // Update vesting data
-    release.executed = true;
-    release.executionDate = now.toISOString();
-    release.transactionId = signature;
-    
-    vestingData.totalReleased += Number(releaseAmount);
-    
-    // Update next release date
-    const nextReleaseIndex = vestingData.releases.findIndex((r: VestingRelease) => !r.executed);
-    if (nextReleaseIndex !== -1) {
-      vestingData.nextReleaseDate = vestingData.releases[nextReleaseIndex].scheduledDate;
-    } else {
-      vestingData.nextReleaseDate = null;
-    }
-    
-    // Save updated vesting data
-    saveVestingData(vestingData);
+    // Update vesting data with locking to prevent race conditions
+    await safeUpdateJSON<VestingData>(
+      VESTING_DATA_PATH,
+      (currentVestingData) => {
+        // Get the up-to-date release record
+        const currentRelease = currentVestingData.releases[releaseNumber - 1];
+        
+        // Verify the release hasn't been executed by another process
+        if (currentRelease.executed) {
+          throw new Error(`Release #${releaseNumber} has already been executed by another process`);
+        }
+        
+        // Update the release information
+        currentRelease.executed = true;
+        currentRelease.executionDate = now.toISOString();
+        currentRelease.transactionId = signature;
+        
+        // Update the total released amount
+        currentVestingData.totalReleased += Number(releaseAmount);
+        
+        // Update next release date
+        const nextReleaseIndex = currentVestingData.releases.findIndex(r => !r.executed);
+        if (nextReleaseIndex !== -1) {
+          currentVestingData.nextReleaseDate = currentVestingData.releases[nextReleaseIndex].scheduledDate;
+        } else {
+          currentVestingData.nextReleaseDate = null;
+        }
+        
+        return currentVestingData;
+      },
+      vestingData
+    );
     
     console.log(`Release executed successfully. Transaction ID: ${signature}`);
-    console.log(`Vesting progress: ${vestingData.totalReleased} / ${vestingData.totalAmount} VCN released`);
+    console.log(`Vesting progress: ${vestingData.totalReleased + Number(releaseAmount)} / ${vestingData.totalAmount} VCN released`);
     
     return signature;
   } catch (error: any) {
@@ -297,11 +334,11 @@ export async function executeRelease(releaseNumber: number): Promise<string> {
 }
 
 // Check vesting status
-export function checkVestingStatus(): void {
+export async function checkVestingStatus(): Promise<void> {
   console.log('\n===== VCoin Vesting Status =====');
   
   try {
-    const vestingData = loadVestingData();
+    const vestingData = await loadVestingData();
     
     if (!vestingData.initialized) {
       console.log('Vesting schedule has not been initialized yet.');
@@ -351,32 +388,43 @@ export async function main() {
       case 'init':
         await initializeVesting();
         break;
+        
       case 'release':
         if (args.length < 2) {
-          console.error('Usage: npm run vesting release <release_index>');
+          console.error('Release number is required.');
+          console.error('Usage: npm run vesting release <number>');
           process.exit(1);
         }
-        const releaseNumber = parseInt(args[1], 10);
-        if (isNaN(releaseNumber)) {
-          console.error('Error: Release number must be a valid integer');
+        
+        const releaseNumber = parseInt(args[1]);
+        if (isNaN(releaseNumber) || releaseNumber < 1) {
+          console.error('Release number must be a positive integer');
           process.exit(1);
         }
-        await executeRelease(releaseNumber);
+        
+        const signature = await executeRelease(releaseNumber);
+        console.log(`Release transaction signature: ${signature}`);
         break;
+        
       case 'status':
-        checkVestingStatus();
+        await checkVestingStatus();
         break;
+        
       default:
+        console.error(`Unknown command: ${command}`);
         showUsage();
-        break;
+        process.exit(1);
     }
-  } catch (error) {
-    console.error('Error:', error);
+  } catch (error: any) {
+    console.error(`Error: ${error.message || error}`);
     process.exit(1);
   }
 }
 
-// Only execute if this file is run directly
+// Run main when script is executed directly
 if (require.main === module) {
-  main();
+  main().catch(error => {
+    console.error('Unhandled error:', error);
+    process.exit(1);
+  });
 } 

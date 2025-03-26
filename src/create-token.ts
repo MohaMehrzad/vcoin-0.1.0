@@ -24,19 +24,20 @@ import {
   TOKEN_DECIMALS,
   TOKEN_TOTAL_SUPPLY,
   tokensToRawAmount,
-  saveTokenMetadata
+  saveTokenMetadata,
+  handleError as globalHandleError,
+  SecurityError,
+  FileOperationError,
+  ValidationError
 } from './utils';
 import { execSync } from 'child_process';
 import { Writable } from 'stream';
 
-// Helper function to handle errors based on environment
-export function handleError(message: string, error?: Error): never {
-  console.error(message, error);
-  if (process.env.NODE_ENV === 'test') {
-    throw error || new Error(message);
-  } else {
-    process.exit(1);
-  }
+// Helper function to handle errors using the standardized approach
+function handleTokenError(message: string, error?: Error): never {
+  const finalError = error || new Error(message);
+  globalHandleError(finalError, true, 'create-token');
+  process.exit(1); // This will only execute if handleError doesn't exit
 }
 
 // Function to get keypair from secret key input
@@ -125,7 +126,7 @@ export async function getKeypairFromPhantom(): Promise<Keypair> {
     
     return keypair;
   } catch (error: any) {
-    throw new Error(`Failed to import keypair: ${error.message}`);
+    throw new SecurityError(`Failed to import keypair: ${error.message}`, 'KEYPAIR_IMPORT_FAILED');
   }
 }
 
@@ -142,16 +143,35 @@ async function saveKeypairSecurely(keypair: Keypair, name: string): Promise<void
   
   const keypairPath = path.resolve(keypairsDir, `${name}.json`);
   
-  // In a production environment, we would encrypt this data
-  // For development purposes, we'll just set strict file permissions
-  fs.writeFileSync(
-    keypairPath,
-    JSON.stringify(Array.from(keypair.secretKey)),
-    { encoding: 'utf-8', mode: 0o600 }  // Only owner can read/write
-  );
+  // In a production environment, we need proper keypair encryption
+  const isProdEnv = process.env.NODE_ENV !== 'development';
   
-  console.log(`\nKeypair saved securely to ${keypairPath}`);
-  console.log('NOTE: In production, implement proper encryption for the keypair file.');
+  if (isProdEnv) {
+    // For production, we require proper encryption
+    try {
+      // Save keypair first then use getOrCreateKeypair to properly encrypt it
+      fs.writeFileSync(
+        keypairPath,
+        JSON.stringify(Array.from(keypair.secretKey)),
+        { encoding: 'utf-8', mode: 0o600 }  // Only owner can read/write temporarily
+      );
+      
+      // Re-load it with encryption
+      await getOrCreateKeypair(name);
+      console.log(`\nKeypair saved securely with encryption to ${keypairPath}`);
+    } catch (error: any) {
+      throw new SecurityError(`Failed to save keypair securely: ${error.message}`, 'KEYPAIR_SAVE_FAILED');
+    }
+  } else {
+    // For development, set strict file permissions at minimum
+    fs.writeFileSync(
+      keypairPath,
+      JSON.stringify(Array.from(keypair.secretKey)),
+      { encoding: 'utf-8', mode: 0o600 }  // Only owner can read/write
+    );
+    
+    console.log(`\nKeypair saved to ${keypairPath} with secure file permissions`);
+  }
 }
 
 export interface CreateVCoinOptions {
@@ -184,7 +204,7 @@ export async function createVCoinToken(options: CreateVCoinOptions = {}) {
   console.log(`Authority balance: ${authorityBalance / LAMPORTS_PER_SOL} SOL`);
   
   if (!skipBalanceCheck && authorityBalance < 0.05 * LAMPORTS_PER_SOL) {
-    return handleError('Error: Authority account does not have enough SOL. Please fund your wallet with at least 0.05 SOL on devnet before continuing.');
+    return handleTokenError('Error: Authority account does not have enough SOL. Please fund your wallet with at least 0.05 SOL on devnet before continuing.');
   }
   
   // Create mint account using token-2022 program
@@ -272,7 +292,7 @@ export async function createVCoinToken(options: CreateVCoinOptions = {}) {
       tokenData
     };
   } catch (error) {
-    return handleError('\nError creating token:', error as Error);
+    return handleTokenError('\nError creating token:', error as Error);
   }
 }
 

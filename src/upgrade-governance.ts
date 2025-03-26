@@ -1,13 +1,40 @@
+import { Keypair, PublicKey } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { Keypair, PublicKey } from '@solana/web3.js';
-import { getOrCreateKeypair, loadTokenMetadata, handleError } from './utils';
-import * as os from 'os'; // Add OS module for host information
+import { 
+  getOrCreateKeypair, 
+  loadTokenMetadata, 
+  handleError, 
+  verifyAuthority,
+  safeReadJSON, 
+  safeWriteJSON, 
+  safeUpdateJSON, 
+  verifySignature, 
+  signData,
+  ValidationError,
+  SecurityError,
+  FileOperationError,
+  AuthorizationError
+} from './utils';
+import * as os from 'os';
+import * as proper from 'proper-lockfile';
 
 // Constants
 const UPGRADE_GOVERNANCE_PATH = path.resolve(process.cwd(), 'upgrade-governance.json');
 const GOVERNANCE_AUDIT_LOG_PATH = path.resolve(process.cwd(), 'governance-audit.log');
+
+// Secure file mode constants
+const SECURE_FILE_MODE = 0o640; // Read/write for owner, read for group
+const SECURE_DIR_MODE = 0o750;  // Read/write/execute for owner, read/execute for group
+
+// Create the governance directory with secure permissions if it doesn't exist
+function ensureSecureDirectory(filePath: string): void {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: SECURE_DIR_MODE });
+  }
+}
 
 // Types
 type UpgradeStatus = 'proposed' | 'approved' | 'executed' | 'rejected';
@@ -56,20 +83,24 @@ interface AuditLogEntry {
   actor: string;
   details: string;
   metadata?: Record<string, any>;
+  signature?: string;
+  verificationStatus?: string;
 }
 
 /**
- * Log an action to the audit log
- * @param action The action being performed
- * @param actor The public key of the actor
- * @param details Details about the action
+ * Log an action to the governance audit log with signature
+ * @param action Action name
+ * @param actor Actor address
+ * @param details Action details
  * @param metadata Additional metadata
+ * @param actorKeypair Optional keypair for signing the entry
  */
 function logAuditAction(
   action: string,
   actor: string,
   details: string,
-  metadata?: Record<string, any>
+  metadata?: Record<string, any>,
+  actorKeypair?: Keypair
 ): void {
   try {
     // Create log entry
@@ -79,24 +110,81 @@ function logAuditAction(
       actor,
       details,
       metadata: {
-        ...metadata,
-        hostname: os.hostname(),
-        platform: os.platform(),
-        networkInterfaces: Object.keys(os.networkInterfaces()).length
+        ...metadata
       }
     };
     
-    // Format as JSON string with newline
-    const logLine = JSON.stringify(entry) + '\n';
+    // In production, always require signed entries
+    const isProdEnv = process.env.NODE_ENV === 'production';
+    if (isProdEnv && !actorKeypair) {
+      console.error('SECURITY ERROR: Refusing to log unsigned audit entry in production');
+      return;
+    }
     
-    // Append to log file
-    fs.appendFileSync(GOVERNANCE_AUDIT_LOG_PATH, logLine, {
-      encoding: 'utf-8',
-      mode: 0o640 // Read/write for owner, read for group
-    });
+    // Sign the entry if keypair is provided
+    if (actorKeypair) {
+      const entryString = JSON.stringify(entry);
+      const signature = crypto.sign(
+        'sha256',
+        Buffer.from(entryString),
+        Buffer.from(actorKeypair.secretKey.slice(0, 32))
+      ).toString('base64');
+      
+      // Add signature to entry
+      entry.signature = signature;
+    }
+    
+    // Create directory if it doesn't exist with secure permissions
+    ensureSecureDirectory(GOVERNANCE_AUDIT_LOG_PATH);
+    
+    // Append to log file with secure permissions
+    fs.appendFileSync(
+      GOVERNANCE_AUDIT_LOG_PATH,
+      JSON.stringify(entry) + '\n',
+      { encoding: 'utf-8', mode: SECURE_FILE_MODE, flag: 'a' }
+    );
+    
+    // Ensure the file maintains secure permissions
+    fs.chmodSync(GOVERNANCE_AUDIT_LOG_PATH, SECURE_FILE_MODE);
+  } catch (error: any) {
+    console.error(`Failed to log audit action: ${error.message}`);
+    
+    // In production, audit log failures are critical
+    if (process.env.NODE_ENV === 'production') {
+      console.error('CRITICAL: Audit logging failed in production environment');
+    }
+  }
+}
+
+/**
+ * Verify the signature of an audit log entry
+ * @param entry Audit log entry
+ * @returns Whether the signature is valid
+ */
+function verifyAuditLogEntry(entry: AuditLogEntry): boolean {
+  if (!entry.signature) {
+    return false;
+  }
+  
+  try {
+    // Copy entry without signature for verification
+    const { signature, ...entryWithoutSignature } = entry;
+    
+    // Get actor's public key
+    const actorPublicKey = new PublicKey(entry.actor);
+    
+    // Verify signature
+    const entryString = JSON.stringify(entryWithoutSignature);
+    const signatureBuffer = Buffer.from(signature, 'base64');
+    
+    return crypto.verify(
+      'sha256',
+      Buffer.from(entryString),
+      Buffer.from(actorPublicKey.toBytes()),
+      signatureBuffer
+    );
   } catch (error) {
-    console.error('Failed to write to audit log:', error);
-    // Continue execution even if logging fails
+    return false;
   }
 }
 
@@ -201,7 +289,8 @@ export async function initializeUpgradeGovernance(
         emergencyThreshold,
         timelock,
         emergencyTimelock
-      }
+      },
+      authorityKeypair
     );
     
     console.log('Upgrade governance initialized successfully');
@@ -217,23 +306,74 @@ export async function initializeUpgradeGovernance(
 }
 
 /**
- * Load upgrade governance configuration
+ * Load upgrade governance configuration with mandatory signature verification
+ * @param skipSignatureVerification Only for testing/dev environments - DO NOT use in production
+ * @returns The verified upgrade governance configuration
+ * @throws {Error} If the configuration is not found, signature is missing or invalid
  */
-export function loadUpgradeGovernance(): UpgradeGovernance {
+export function loadUpgradeGovernance(skipSignatureVerification: boolean = false): UpgradeGovernance {
+  // Only allow skipping signature verification in non-production environments
+  if (skipSignatureVerification && process.env.NODE_ENV === 'production') {
+    throw new Error('Signature verification cannot be skipped in production environment');
+  }
+
   if (!fs.existsSync(UPGRADE_GOVERNANCE_PATH)) {
     throw new Error('Upgrade governance not initialized');
   }
   
   try {
-    const data = fs.readFileSync(UPGRADE_GOVERNANCE_PATH, 'utf-8');
-    return JSON.parse(data) as UpgradeGovernance;
+    const governanceData = JSON.parse(fs.readFileSync(UPGRADE_GOVERNANCE_PATH, 'utf-8'));
+    
+    // Always verify the integrity of the configuration file
+    if (!skipSignatureVerification) {
+      // Signature is required
+      if (!governanceData.signature) {
+        throw new Error('Upgrade governance configuration is missing a signature. File may be tampered with or corrupted.');
+      }
+      
+      const { signature, ...governanceWithoutSignature } = governanceData;
+      
+      // Check if the authorityAddress is present and valid
+      if (!governanceData.authorityAddress) {
+        throw new Error('Upgrade governance configuration is missing the authorityAddress field.');
+      }
+      
+      try {
+        const authorityPublicKey = new PublicKey(governanceData.authorityAddress);
+        
+        const message = JSON.stringify(governanceWithoutSignature, null, 2);
+        const messageBuffer = Buffer.from(message);
+        
+        const signatureBuffer = Buffer.from(signature, 'base64');
+        const isValid = crypto.verify(
+          'sha256',
+          messageBuffer,
+          Buffer.from(authorityPublicKey.toBytes()),
+          signatureBuffer
+        );
+        
+        if (!isValid) {
+          throw new Error('Upgrade governance configuration signature is invalid. File may have been tampered with.');
+        }
+      } catch (error: any) {
+        if (error.message.includes('Invalid public key')) {
+          throw new Error(`Invalid authority public key in configuration: ${governanceData.authorityAddress}`);
+        }
+        throw error;
+      }
+    } else {
+      // Development-only code path
+      console.warn('WARNING: Signature verification skipped for upgrade governance. This should only be used in development.');
+    }
+    
+    return governanceData;
   } catch (error: any) {
     throw new Error(`Failed to load upgrade governance: ${error.message}`);
   }
 }
 
 /**
- * Save upgrade governance configuration
+ * Save upgrade governance configuration with secure permissions
  */
 function saveUpgradeGovernance(governance: UpgradeGovernance, authorityKeypair: Keypair): void {
   try {
@@ -254,15 +394,64 @@ function saveUpgradeGovernance(governance: UpgradeGovernance, authorityKeypair: 
       signature: signature.toString('base64')
     };
     
-    // Save
+    // Ensure directory exists with secure permissions
+    ensureSecureDirectory(UPGRADE_GOVERNANCE_PATH);
+    
+    // Write to temporary file first (atomic write operation)
+    const tempPath = `${UPGRADE_GOVERNANCE_PATH}.tmp`;
     fs.writeFileSync(
-      UPGRADE_GOVERNANCE_PATH,
+      tempPath,
       JSON.stringify(governanceWithSignature, null, 2),
-      { encoding: 'utf-8', mode: 0o640 }
+      { encoding: 'utf-8', mode: SECURE_FILE_MODE }
     );
+    
+    // Rename is atomic on most filesystems
+    fs.renameSync(tempPath, UPGRADE_GOVERNANCE_PATH);
+    
+    // Ensure the final file has secure permissions
+    fs.chmodSync(UPGRADE_GOVERNANCE_PATH, SECURE_FILE_MODE);
     
   } catch (error: any) {
     throw new Error(`Failed to save upgrade governance: ${error.message}`);
+  }
+}
+
+/**
+ * Verify the integrity of upgrade governance config and load it 
+ * with appropriate security checks for the environment
+ * @returns Verified upgrade governance config
+ */
+function loadVerifiedUpgradeGovernance(): UpgradeGovernance {
+  const isProdEnv = process.env.NODE_ENV !== 'development';
+  
+  try {
+    // Always enforce signature verification
+    return loadUpgradeGovernance(false);
+  } catch (error: any) {
+    // In development only, allow fallback if explicitly enabled
+    if (!isProdEnv && process.env.ALLOW_UNSIGNED_CONFIG === 'true') {
+      console.warn('WARNING: Loading unsigned governance configuration due to ALLOW_UNSIGNED_CONFIG=true');
+      console.warn('This should NEVER be done in production environments');
+      try {
+        return loadUpgradeGovernance(true);
+      } catch (fallbackError: any) {
+        throw new SecurityError(
+          `Failed to load governance config even with signature verification disabled: ${fallbackError.message}`,
+          'CONFIG_LOAD_FAILED_WITH_FALLBACK'
+        );
+      }
+    }
+    
+    // In production, never fallback - always enforce signature verification
+    if (isProdEnv) {
+      console.error('CRITICAL SECURITY ERROR: Failed to verify governance configuration signature in production');
+      console.error(error.message);
+      // In production, this is a critical security event - we shouldn't proceed
+      process.exit(1);
+    }
+    
+    // Propagate the original error
+    throw error;
   }
 }
 
@@ -271,9 +460,10 @@ function saveUpgradeGovernance(governance: UpgradeGovernance, authorityKeypair: 
  */
 export function isCouncilMember(address: string): boolean {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     return governance.council.includes(address);
-  } catch (error) {
+  } catch (error: any) {
+    handleError(error, false, 'upgrade-governance:isCouncilMember');
     return false;
   }
 }
@@ -292,12 +482,12 @@ export async function proposeUpgrade(
   executeAfterDays: number = 0
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify proposer is a council member
     const proposerAddress = proposerKeypair.publicKey.toString();
     if (!governance.council.includes(proposerAddress)) {
-      throw new Error('Only council members can propose upgrades');
+      throw new AuthorizationError('Only council members can propose upgrades', 'UNAUTHORIZED_PROPOSER');
     }
     
     // Validate execute after days
@@ -314,10 +504,16 @@ export async function proposeUpgrade(
     const files: { path: string; checksum: string }[] = [];
     for (const filePath of filePaths) {
       if (!fs.existsSync(filePath)) {
-        throw new Error(`File not found: ${filePath}`);
+        throw new FileOperationError(`File not found: ${filePath}`, 'FILE_NOT_FOUND');
       }
       
-      const fileContent = fs.readFileSync(filePath, 'utf-8');
+      let fileContent;
+      try {
+        fileContent = fs.readFileSync(filePath, 'utf-8');
+      } catch (error: any) {
+        throw new FileOperationError(`Failed to read file ${filePath}: ${error.message}`, 'FILE_READ_ERROR');
+      }
+      
       const checksum = crypto.createHash('sha256').update(fileContent).digest('hex');
       
       files.push({
@@ -347,19 +543,28 @@ export async function proposeUpgrade(
     governance.proposals.push(proposal);
     
     // Save governance
-    saveUpgradeGovernance(governance, proposerKeypair);
+    try {
+      saveUpgradeGovernance(governance, proposerKeypair);
+    } catch (error: any) {
+      throw new FileOperationError(`Failed to save upgrade governance: ${error.message}`, 'GOVERNANCE_SAVE_ERROR');
+    }
     
     // Log action to audit log
-    logAuditAction(
-      'PROPOSE_UPGRADE',
-      proposerAddress,
-      `Proposed upgrade: ${description}`,
-      {
-        proposalId: proposal.id,
-        files: files.map(f => f.path),
-        executeAfter: executeAfter.toISOString()
-      }
-    );
+    try {
+      logAuditAction(
+        'PROPOSE_UPGRADE',
+        proposerAddress,
+        `Proposed upgrade: ${description}`,
+        {
+          proposalId: proposal.id,
+          files: files.map(f => f.path),
+          executeAfter: executeAfter.toISOString()
+        },
+        proposerKeypair
+      );
+    } catch (error: any) {
+      console.warn(`Warning: Failed to log audit action: ${error.message}`);
+    }
     
     console.log(`Upgrade proposal created successfully. ID: ${proposal.id}`);
     console.log(`Description: ${description}`);
@@ -368,7 +573,8 @@ export async function proposeUpgrade(
     console.log(`Initial approval: 1/${governance.threshold}`);
     
   } catch (error: any) {
-    handleError(`Failed to propose upgrade: ${error.message}`, error);
+    handleError(error, false, 'upgrade-governance:proposeUpgrade');
+    throw error;
   }
 }
 
@@ -386,7 +592,7 @@ export async function proposeEmergencyUpgrade(
   justification: string
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify proposer is a council member
     const proposerAddress = proposerKeypair.publicKey.toString();
@@ -447,7 +653,8 @@ export async function proposeEmergencyUpgrade(
         files: files.map(f => f.path),
         justification,
         executeAfter: executeAfter.toISOString()
-      }
+      },
+      proposerKeypair
     );
     
     console.log(`EMERGENCY upgrade proposal created. ID: ${proposal.id}`);
@@ -504,7 +711,7 @@ export async function voteOnProposal(
   approved: boolean
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify voter authorization
     const voterAddress = voterKeypair.publicKey.toString();
@@ -559,7 +766,8 @@ export async function voteOnProposal(
           approved,
           isEmergency: proposal.isEmergency,
           onBehalfOf: voterAddress !== councilMemberAddress ? councilMemberAddress : undefined
-        }
+        },
+        voterKeypair
       );
     } else {
       // Add new vote
@@ -579,7 +787,8 @@ export async function voteOnProposal(
           approved,
           isEmergency: proposal.isEmergency,
           onBehalfOf: voterAddress !== councilMemberAddress ? councilMemberAddress : undefined
-        }
+        },
+        voterKeypair
       );
     }
     
@@ -611,7 +820,8 @@ export async function voteOnProposal(
           rejectionVotes,
           threshold: requiredThreshold,
           isEmergency: proposal.isEmergency
-        }
+        },
+        voterKeypair
       );
     }
     
@@ -631,12 +841,27 @@ export async function voteOnProposal(
           approvalVotes,
           rejectionVotes,
           isEmergency: proposal.isEmergency
-        }
+        },
+        voterKeypair
       );
     }
     
     // Save governance
     saveUpgradeGovernance(governance, voterKeypair);
+    
+    console.log(`Vote recorded for proposal: ${proposalId}`);
+    console.log(`Current votes: ${approvalVotes} approve, ${rejectionVotes} reject`);
+    
+    if (proposal.status === 'approved') {
+      console.log(`Proposal has been APPROVED (threshold: ${requiredThreshold})`);
+      const executeAfter = new Date(proposal.executeAfter);
+      console.log(`Executable after: ${executeAfter.toLocaleString()}`);
+    } else if (proposal.status === 'rejected') {
+      console.log(`Proposal has been REJECTED (threshold: ${requiredThreshold})`);
+    } else {
+      const requiredVotes = Math.max(requiredThreshold - approvalVotes, 0);
+      console.log(`Proposal still needs ${requiredVotes} more approval votes to pass`);
+    }
     
   } catch (error: any) {
     handleError(`Failed to vote on proposal: ${error.message}`, error);
@@ -653,7 +878,7 @@ export async function executeProposal(
   proposalId: string
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify executor is a council member
     const executorAddress = executorKeypair.publicKey.toString();
@@ -735,7 +960,7 @@ export async function executeProposal(
  */
 export function listProposals(): void {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     console.log('===== VCoin Upgrade Governance =====');
     console.log(`Mint Address: ${governance.mintAddress}`);
@@ -825,12 +1050,10 @@ export async function addCouncilMember(
   memberAddress: string
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the council');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify council');
     
     // Validate address
     try {
@@ -880,12 +1103,10 @@ export async function removeCouncilMember(
   memberAddress: string
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the council');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify council');
     
     // Check if member exists
     if (!governance.council.includes(memberAddress)) {
@@ -936,12 +1157,10 @@ export async function updateThreshold(
   threshold: number
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the threshold');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify threshold');
     
     // Validate threshold
     if (threshold <= 0 || threshold > governance.council.length) {
@@ -983,12 +1202,10 @@ export async function updateTimelock(
   timelock: number
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the timelock');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify timelock');
     
     // Validate timelock
     if (timelock < 1) {
@@ -1030,12 +1247,10 @@ export async function updateEmergencyThreshold(
   threshold: number
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the threshold');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify emergency threshold');
     
     // Validate threshold
     if (threshold <= 0 || threshold > governance.council.length) {
@@ -1077,12 +1292,10 @@ export async function updateEmergencyTimelock(
   timelock: number
 ): Promise<void> {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
-    // Verify authority
-    if (governance.authorityAddress !== authorityKeypair.publicKey.toString()) {
-      throw new Error('Only the authority can modify the timelock');
-    }
+    // Verify authority using standardized function
+    verifyAuthority(authorityKeypair.publicKey, new PublicKey(governance.authorityAddress), 'modify emergency timelock');
     
     // Validate timelock
     if (timelock < 1) {
@@ -1117,12 +1330,20 @@ export async function updateEmergencyTimelock(
 /**
  * Display the governance audit log
  * @param limit Number of entries to display (default: 20)
+ * @param skipSignatureVerification Skip signature verification (only in development; ignored in production)
  */
-export function showAuditLog(limit: number = 20): void {
+export function showAuditLog(limit: number = 20, skipSignatureVerification: boolean = false): void {
   try {
     if (!fs.existsSync(GOVERNANCE_AUDIT_LOG_PATH)) {
       console.log('No audit log found.');
       return;
+    }
+    
+    // Force verification in production
+    const isProdEnv = process.env.NODE_ENV === 'production';
+    if (isProdEnv && skipSignatureVerification) {
+      console.error('SECURITY WARNING: Signature verification cannot be skipped in production environment');
+      skipSignatureVerification = false;
     }
     
     // Read log file
@@ -1136,7 +1357,33 @@ export function showAuditLog(limit: number = 20): void {
     const entries = logLines
       .map(line => {
         try {
-          return JSON.parse(line) as AuditLogEntry;
+          const entry = JSON.parse(line) as AuditLogEntry;
+          
+          // Always verify in production, optionally in development
+          if (isProdEnv || !skipSignatureVerification) {
+            if (entry.signature) {
+              if (!verifyAuditLogEntry(entry)) {
+                console.warn(`WARNING: Entry with invalid signature: ${entry.action} by ${entry.actor} at ${entry.timestamp}`);
+                entry.verificationStatus = 'INVALID';
+                
+                // In production, invalid signatures are a security concern
+                if (isProdEnv) {
+                  console.error('SECURITY ALERT: Invalid signature detected in audit log in production environment');
+                }
+              } else {
+                entry.verificationStatus = 'VERIFIED';
+              }
+            } else {
+              entry.verificationStatus = 'UNSIGNED';
+              
+              // In production, unsigned entries are a security concern
+              if (isProdEnv) {
+                console.error('SECURITY ALERT: Unsigned entry detected in audit log in production environment');
+              }
+            }
+          }
+          
+          return entry;
         } catch {
           return null;
         }
@@ -1154,7 +1401,9 @@ export function showAuditLog(limit: number = 20): void {
       if (!entry) return;
       
       const date = new Date(entry.timestamp).toLocaleString();
-      console.log(`[${date}] ${entry.action} by ${entry.actor}`);
+      const verificationStatus = entry.verificationStatus ? 
+        ` [${entry.verificationStatus}]` : '';
+      console.log(`[${date}] ${entry.action} by ${entry.actor}${verificationStatus}`);
       console.log(`  ${entry.details}`);
       
       if (entry.metadata) {
@@ -1201,7 +1450,7 @@ export async function delegateVoting(
 ): Promise<void> {
   try {
     // Load governance
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify council membership
     const councilAddress = councilKeypair.publicKey.toString();
@@ -1270,7 +1519,7 @@ export async function revokeDelegation(
 ): Promise<void> {
   try {
     // Load governance
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     // Verify council membership
     const councilAddress = councilKeypair.publicKey.toString();
@@ -1316,7 +1565,7 @@ export async function revokeDelegation(
  */
 export function listDelegations(): void {
   try {
-    const governance = loadUpgradeGovernance();
+    const governance = loadVerifiedUpgradeGovernance();
     
     console.log('===== Active Voting Delegations =====');
     
@@ -1361,6 +1610,47 @@ export async function main() {
   const command = args[0];
   
   try {
+    // Production-specific security checks
+    const isProdEnv = process.env.NODE_ENV === 'production';
+    if (isProdEnv) {
+      // Ensure command is provided in production
+      if (!command) {
+        console.error('ERROR: Command must be specified in production environment');
+        showUsage();
+        process.exit(1);
+      }
+      
+      // Ensure NODE_ENV is explicitly set to production
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('CRITICAL SECURITY WARNING: Running in production but NODE_ENV is not set to "production"');
+        process.exit(1);
+      }
+      
+      // Verify secure file permissions on existing files
+      if (fs.existsSync(UPGRADE_GOVERNANCE_PATH)) {
+        try {
+          const stats = fs.statSync(UPGRADE_GOVERNANCE_PATH);
+          // Check if permissions are more permissive than 0o640
+          if ((stats.mode & 0o777) > SECURE_FILE_MODE) {
+            console.error(`SECURITY ERROR: Governance file has insecure permissions: ${(stats.mode & 0o777).toString(8)}`);
+            console.error(`Expected: ${SECURE_FILE_MODE.toString(8)}`);
+            fs.chmodSync(UPGRADE_GOVERNANCE_PATH, SECURE_FILE_MODE);
+            console.error('Permissions corrected. Please check for potential security breach.');
+          }
+        } catch (error) {
+          console.error(`Failed to check file permissions: ${error}`);
+        }
+      }
+    }
+    
+    // Get authority keypair
+    const authorityKeypair = await getOrCreateKeypair('authority');
+    
+    if (!command) {
+      showUsage();
+      return;
+    }
+    
     switch (command) {
       case 'init':
         {
@@ -1376,7 +1666,6 @@ export async function main() {
           const emergencyThreshold = args[4] ? parseInt(args[4]) : undefined;
           const emergencyTimelock = args[5] ? parseInt(args[5]) : undefined;
           
-          const authorityKeypair = await getOrCreateKeypair('authority');
           await initializeUpgradeGovernance(
             authorityKeypair, 
             councilAddresses, 
@@ -1385,6 +1674,37 @@ export async function main() {
             emergencyThreshold, 
             emergencyTimelock
           );
+        }
+        break;
+        
+      case 'check':
+        // Check configuration integrity and version
+        try {
+          const config = loadVerifiedUpgradeGovernance();
+          console.log('\n=== Upgrade Governance Configuration ===');
+          console.log(`Mint Address: ${config.mintAddress}`);
+          console.log(`Authority: ${config.authorityAddress}`);
+          
+          console.log('\nCouncil Members:');
+          config.council.forEach((member, index) => {
+            console.log(`- ${index + 1}: ${member}`);
+          });
+          
+          console.log('\nThresholds:');
+          console.log(`- Regular: ${config.threshold} votes`);
+          console.log(`- Emergency: ${config.emergencyThreshold} votes`);
+          
+          console.log('\nTimelocks:');
+          console.log(`- Regular: ${config.timelock} days`);
+          console.log(`- Emergency: ${config.emergencyTimelock} days`);
+          
+          console.log('\nSignature Verification: PASSED');
+          console.log('=============================');
+        } catch (error: any) {
+          console.error('\n=== Upgrade Governance Check FAILED ===');
+          console.error(`Error: ${error.message}`);
+          console.error('==========================================');
+          process.exit(1);
         }
         break;
         
@@ -1604,30 +1924,47 @@ export async function main() {
         break;
         
       default:
-        console.log('VCoin Upgrade Governance');
-        console.log('Available commands:');
-        console.log('  npm run upgrade init <council_addresses> <threshold> <timelock> [emergency_threshold] [emergency_timelock] - Initialize upgrade governance');
-        console.log('  npm run upgrade list - List all upgrade proposals');
-        console.log('  npm run upgrade propose <description> <file_paths> [execute_after_days] - Propose an upgrade');
-        console.log('  npm run upgrade propose-emergency <description> <file_paths> <justification> - Propose an emergency upgrade');
-        console.log('  npm run upgrade vote <proposal_id> <approve|reject> [keypair_name] - Vote on a proposal');
-        console.log('  npm run upgrade execute <proposal_id> [keypair_name] - Execute an approved proposal');
-        console.log('  npm run upgrade add-member <member_address> - Add a council member');
-        console.log('  npm run upgrade remove-member <member_address> - Remove a council member');
-        console.log('  npm run upgrade update-threshold <threshold> - Update the approval threshold');
-        console.log('  npm run upgrade update-timelock <timelock_days> - Update the timelock period');
-        console.log('  npm run upgrade update-emergency-threshold <threshold> - Update the emergency approval threshold');
-        console.log('  npm run upgrade update-emergency-timelock <timelock_days> - Update the emergency timelock period');
-        console.log('  npm run upgrade audit [limit] - Show governance audit log (default: last 20 entries)');
-        console.log('  npm run upgrade delegate <delegate_address> <duration_days> [keypair_name] - Delegate voting rights');
-        console.log('  npm run upgrade revoke-delegation [keypair_name] - Revoke a voting delegation');
-        console.log('  npm run upgrade list-delegations - List all active delegations');
-        break;
+        showUsage();
+        process.exit(1);
     }
-  } catch (error) {
-    console.error('Error:', error);
+  } catch (error: any) {
+    console.error(`Error: ${error.message}`);
+    
+    // In production, any error is potentially serious
+    if (process.env.NODE_ENV === 'production') {
+      console.error('CRITICAL ERROR in production environment');
+      if (error.stack) {
+        console.error(error.stack);
+      }
+    }
+    
     process.exit(1);
   }
+}
+
+/**
+ * Display usage information
+ */
+function showUsage() {
+  console.log('Usage: npm run upgrade <command>');
+  console.log('\nCommands:');
+  console.log('  init - Initialize upgrade governance');
+  console.log('  check - Check governance configuration integrity');
+  console.log('  list - List all upgrade proposals');
+  console.log('  propose <description> <file_paths> [execute_after_days] - Propose an upgrade');
+  console.log('  propose-emergency <description> <file_paths> <justification> - Propose an emergency upgrade');
+  console.log('  vote <proposal_id> <approve|reject> [keypair_name] - Vote on a proposal');
+  console.log('  execute <proposal_id> [keypair_name] - Execute an approved proposal');
+  console.log('  add-member <member_address> - Add a council member');
+  console.log('  remove-member <member_address> - Remove a council member');
+  console.log('  update-threshold <threshold> - Update the approval threshold');
+  console.log('  update-timelock <timelock_days> - Update the timelock period');
+  console.log('  update-emergency-threshold <threshold> - Update the emergency approval threshold');
+  console.log('  update-emergency-timelock <timelock_days> - Update the emergency timelock period');
+  console.log('  audit [limit] - Show governance audit log');
+  console.log('  delegate <delegate_address> <duration_days> [keypair_name] - Delegate voting rights');
+  console.log('  revoke-delegation [keypair_name] - Revoke a voting delegation');
+  console.log('  list-delegations - List all active delegations');
 }
 
 // Execute main function if this file is run directly

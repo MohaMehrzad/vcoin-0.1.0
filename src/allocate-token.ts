@@ -22,6 +22,7 @@ import {
   VESTING_ALLOCATION,
   tokensToRawAmount,
   saveTokenMetadata,
+  verifyAuthority
 } from './utils';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -71,13 +72,8 @@ export async function allocateTokens() {
   const authorityKeypair = await getOrCreateKeypair('authority');
   console.log(`Authority: ${authorityKeypair.publicKey.toString()}`);
   
-  // Verify the loaded authority matches the token metadata
-  if (!authorityKeypair.publicKey.equals(authorityAddress)) {
-    handleError('The loaded authority keypair does not match the token authority.\n' +
-      `Expected: ${authorityAddress.toString()}\n` +
-      `Loaded: ${authorityKeypair.publicKey.toString()}\n` +
-      'Please ensure you are using the same wallet that created the token.');
-  }
+  // Verify the loaded authority matches the token metadata using standardized function
+  verifyAuthority(authorityKeypair.publicKey, authorityAddress, 'allocate tokens');
   
   // Check authority balance
   const solBalance = await connection.getBalance(authorityKeypair.publicKey);
