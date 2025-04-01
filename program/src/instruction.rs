@@ -28,6 +28,10 @@ pub enum VCoinInstruction {
         decimals: u8,
         /// Initial supply
         initial_supply: u64,
+        /// Transfer fee basis points (optional, default 500 = 5%)
+        transfer_fee_basis_points: Option<u16>,
+        /// Maximum fee rate as percentage of the transfer amount (optional, default 1)
+        maximum_fee_rate: Option<u8>,
     },
     /// Initialize a presale
     /// 
@@ -145,6 +149,58 @@ pub enum VCoinInstruction {
     /// 0. `[signer]` The authority
     /// 1. `[writable]` The presale state account
     EndPresale,
+    /// Initialize Autonomous Supply Controller
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The initializer (temporary authority, just for setup)
+    /// 1. `[writable]` The controller state account
+    /// 2. `[]` The mint account
+    /// 3. `[]` The price oracle account
+    /// 4. `[]` The system program
+    /// 5. `[]` The token program
+    /// 6. `[]` The rent sysvar
+    InitializeAutonomousController {
+        /// Initial token price (with 6 decimals precision)
+        initial_price: u64,
+        /// Maximum token supply (with appropriate decimals)
+        max_supply: u64,
+    },
+    /// Update Price from Oracle
+    /// 
+    /// Accounts expected:
+    /// 0. `[]` The controller state account
+    /// 1. `[]` The price oracle account
+    /// 2. `[]` The clock sysvar
+    UpdateOraclePrice,
+    /// Execute Autonomous Mint
+    /// 
+    /// Accounts expected:
+    /// 0. `[writable]` The controller state account
+    /// 1. `[writable]` The mint account
+    /// 2. `[]` The mint authority PDA
+    /// 3. `[writable]` The destination account to receive newly minted tokens
+    /// 4. `[]` The token program
+    /// 5. `[]` The clock sysvar
+    ExecuteAutonomousMint,
+    /// Execute Autonomous Burn
+    /// 
+    /// Accounts expected:
+    /// 0. `[writable]` The controller state account
+    /// 1. `[writable]` The mint account
+    /// 2. `[]` The mint authority PDA
+    /// 3. `[writable]` The token account to burn tokens from
+    /// 4. `[]` The token program
+    /// 5. `[]` The clock sysvar
+    ExecuteAutonomousBurn,
+    /// Permanently Disable Program Upgrades
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The current upgrade authority
+    /// 1. `[]` The program account for this program
+    /// 2. `[]` The program data account for this program
+    /// 3. `[]` The system program
+    /// 4. `[]` The BPF Upgradeable Loader program
+    PermanentlyDisableUpgrades,
 }
 
 /// Parameters for initializing a token
@@ -164,6 +220,10 @@ pub struct InitializeTokenParams {
     pub decimals: u8,
     /// Initial supply
     pub initial_supply: u64,
+    /// Transfer fee basis points (optional, default 500 = 5%)
+    pub transfer_fee_basis_points: Option<u16>,
+    /// Maximum fee rate as percentage of the transfer amount (optional, default 1)
+    pub maximum_fee_rate: Option<u8>,
 }
 
 /// Parameters for initializing a presale
@@ -242,6 +302,8 @@ impl VCoinInstruction {
             symbol: params.symbol.clone(),
             decimals: params.decimals,
             initial_supply: params.initial_supply,
+            transfer_fee_basis_points: params.transfer_fee_basis_points,
+            maximum_fee_rate: params.maximum_fee_rate,
         };
         let data = to_vec(&instr)?;
 
@@ -476,6 +538,126 @@ impl VCoinInstruction {
         let accounts = vec![
             AccountMeta::new_readonly(*authority, true),           // Authority (signer)
             AccountMeta::new(*presale, false),                     // Presale state account
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new InitializeAutonomousController instruction
+    pub fn initialize_autonomous_controller(
+        program_id: &Pubkey,
+        initial_price: u64,
+        max_supply: u64,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::InitializeAutonomousController {
+            initial_price,
+            max_supply,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::default(), true), // Temporary authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Controller state account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Mint account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Price oracle account
+            AccountMeta::new_readonly(system_program::id(), false), // System program
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+            AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false), // Rent sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new UpdateOraclePrice instruction
+    pub fn update_oracle_price(
+        program_id: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::UpdateOraclePrice;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::default(), false), // Controller state account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Price oracle account
+            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new ExecuteAutonomousMint instruction
+    pub fn execute_autonomous_mint(
+        program_id: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ExecuteAutonomousMint;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::default(), false), // Controller state account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Mint account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Mint authority PDA
+            AccountMeta::new(Pubkey::default(), false),            // Destination account
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new ExecuteAutonomousBurn instruction
+    pub fn execute_autonomous_burn(
+        program_id: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ExecuteAutonomousBurn;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new(Pubkey::default(), false),          // Controller state account
+            AccountMeta::new(Pubkey::default(), false),          // Mint account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Mint authority PDA
+            AccountMeta::new(Pubkey::default(), false),          // Token account to burn from
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new PermanentlyDisableUpgrades instruction
+    pub fn permanently_disable_upgrades(
+        program_id: &Pubkey,
+        current_upgrade_authority: &Pubkey,
+        program_account: &Pubkey,
+        program_data_account: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::PermanentlyDisableUpgrades;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
+            AccountMeta::new_readonly(*program_account, false),            // Program account
+            AccountMeta::new_readonly(*program_data_account, false),         // Program data account
+            AccountMeta::new_readonly(system_program::id(), false),            // System program
+            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
         ];
 
         Ok(Instruction {

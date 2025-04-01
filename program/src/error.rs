@@ -108,6 +108,54 @@ pub enum VCoinError {
     /// Transfer fee not supported
     #[error("Transfer fee not supported")]
     TransferFeeNotSupported,
+
+    /// Exceeds maximum fee
+    #[error("Exceeds maximum fee of 10%")]
+    ExceedsMaximumFee,
+
+    /// Beneficiary already exists
+    #[error("Beneficiary already exists")]
+    BeneficiaryAlreadyExists,
+
+    /// Invalid oracle account
+    #[error("Invalid oracle account")]
+    InvalidOracleAccount,
+
+    /// Invalid mint authority
+    #[error("Invalid mint authority")]
+    InvalidMintAuthority,
+
+    /// Too early for minting
+    #[error("Too early for minting")]
+    TooEarlyForMinting,
+
+    /// Too early for burning
+    #[error("Too early for burning")]
+    TooEarlyForBurning,
+
+    /// Exceeds maximum supply
+    #[error("Exceeds maximum supply")]
+    ExceedsMaximumSupply,
+
+    /// Invalid supply parameters
+    #[error("Invalid supply parameters")]
+    InvalidSupplyParameters,
+
+    /// Price manipulation detected
+    #[error("Price manipulation detected")]
+    PriceManipulationDetected,
+
+    /// Stale oracle data
+    #[error("Stale oracle data")]
+    StaleOracleData,
+
+    /// Invalid program account
+    #[error("Invalid program account")]
+    InvalidProgramAccount,
+
+    /// Invalid BPF loader program
+    #[error("Invalid BPF loader program")]
+    InvalidBPFLoaderProgram,
 }
 
 impl From<VCoinError> for ProgramError {

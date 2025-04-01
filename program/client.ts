@@ -17,7 +17,7 @@ import path from 'path';
 import { Buffer } from 'buffer';
 
 // Program ID for the VCoin program
-const PROGRAM_ID = new PublicKey('Vco1n111111111111111111111111111111111111111');
+const PROGRAM_ID = new PublicKey('EN2iB89UiwxoVruW1yYghKxnjuBa4KpxDWEqF4nR6NtG');
 
 // Instruction types
 enum InstructionType {
@@ -38,17 +38,23 @@ class InitializeTokenArgs {
   symbol: string;
   decimals: number;
   initialSupply: bigint;
+  transferFeeBasisPoints: number | null;
+  maximumFeeRate: number | null;
 
   constructor(fields: {
     name: string;
     symbol: string;
     decimals: number;
     initialSupply: bigint;
+    transferFeeBasisPoints?: number;
+    maximumFeeRate?: number;
   }) {
     this.name = fields.name;
     this.symbol = fields.symbol;
     this.decimals = fields.decimals;
     this.initialSupply = fields.initialSupply;
+    this.transferFeeBasisPoints = fields.transferFeeBasisPoints || null;
+    this.maximumFeeRate = fields.maximumFeeRate || null;
   }
 
   static schema = new Map([
@@ -61,6 +67,8 @@ class InitializeTokenArgs {
           ['symbol', 'string'],
           ['decimals', 'u8'],
           ['initialSupply', 'u64'],
+          ['transferFeeBasisPoints', { kind: 'option', type: 'u16' }],
+          ['maximumFeeRate', { kind: 'option', type: 'u8' }],
         ],
       },
     ],
@@ -90,7 +98,9 @@ export class VCoinClient {
     name: string,
     symbol: string,
     decimals: number,
-    initialSupply: bigint
+    initialSupply: bigint,
+    transferFeeBasisPoints?: number,
+    maximumFeeRate?: number
   ): Promise<PublicKey> {
     // Generate a new keypair for the mint
     const mint = Keypair.generate();
@@ -101,6 +111,8 @@ export class VCoinClient {
       symbol,
       decimals,
       initialSupply,
+      transferFeeBasisPoints,
+      maximumFeeRate,
     });
 
     const instructionData = Buffer.alloc(1000); // Allocate enough space
@@ -226,7 +238,9 @@ async function main() {
     'VCoin Token',
     'VCN',
     9,
-    BigInt(1_000_000_000_000_000_000) // 1 billion tokens with 9 decimals
+    BigInt(1_000_000_000_000_000_000), // 1 billion tokens with 9 decimals
+    300, // 3% transfer fee (300 basis points)
+    2 // 2% maximum fee
   );
   
   // Initialize presale
