@@ -77,6 +77,10 @@ pub enum VCoinError {
     #[error("Invalid presale parameters")]
     InvalidPresaleParameters,
 
+    /// Soft cap too low
+    #[error("Soft cap too low")]
+    SoftCapTooLow,
+
     /// Invalid vesting parameters
     #[error("Invalid vesting parameters")]
     InvalidVestingParameters,
@@ -149,6 +153,14 @@ pub enum VCoinError {
     #[error("Stale oracle data")]
     StaleOracleData,
 
+    /// Moderately stale oracle data (warning level)
+    #[error("Moderately stale oracle data")]
+    ModeratelyStaleOracleData,
+
+    /// Critically stale oracle data (error level)
+    #[error("Critically stale oracle data")]
+    CriticallyStaleOracleData,
+
     /// Invalid program account
     #[error("Invalid program account")]
     InvalidProgramAccount,
@@ -156,6 +168,54 @@ pub enum VCoinError {
     /// Invalid BPF loader program
     #[error("Invalid BPF loader program")]
     InvalidBPFLoaderProgram,
+
+    /// Invalid oracle data
+    #[error("Invalid oracle data")]
+    InvalidOracleData,
+
+    /// Invalid oracle provider
+    #[error("Invalid oracle provider")]
+    InvalidOracleProvider,
+
+    /// Invalid burn treasury
+    #[error("Invalid burn treasury")]
+    InvalidBurnTreasury,
+
+    /// Unauthorized burn source
+    #[error("Unauthorized burn source")]
+    UnauthorizedBurnSource,
+
+    /// Reentrancy detected
+    #[error("Reentrancy detected")]
+    ReentrancyDetected,
+
+    /// Excessive price change
+    #[error("Excessive price change")]
+    ExcessivePriceChange,
+
+    /// Low confidence price data
+    #[error("Low confidence price data")]
+    LowConfidencePriceData,
+
+    /// Invalid PDA derivation
+    #[error("Invalid PDA derivation")]
+    InvalidPdaDerivation,
+
+    /// Invalid mint configuration
+    #[error("Invalid mint configuration")]
+    InvalidMintConfiguration,
+
+    /// Oracle price deviation
+    #[error("Oracle price deviation exceeds threshold")]
+    OraclePriceDeviation,
+
+    /// Invalid fee amount
+    #[error("Invalid fee amount - exceeds 1% maximum (100 basis points)")]
+    InvalidFeeAmount,
+
+    /// Token already launched
+    #[error("Token has already been launched")]
+    TokenAlreadyLaunched,
 }
 
 impl From<VCoinError> for ProgramError {

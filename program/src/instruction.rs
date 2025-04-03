@@ -39,9 +39,10 @@ pub enum VCoinInstruction {
     /// 0. `[signer]` The authority
     /// 1. `[writable]` The presale state account
     /// 2. `[]` The mint account
-    /// 3. `[writable]` The treasury account
-    /// 4. `[]` The system program
-    /// 5. `[]` Rent sysvar
+    /// 3. `[writable]` The development treasury account (receives 50% of funds immediately)
+    /// 4. `[writable]` The locked treasury account (holds 50% for potential refunds)
+    /// 5. `[]` The system program
+    /// 6. `[]` Rent sysvar
     InitializePresale {
         /// Start time of the presale
         start_time: i64,
@@ -58,7 +59,7 @@ pub enum VCoinInstruction {
         /// Maximum purchase amount in USD (as u64 with 6 decimals precision)
         max_purchase: u64,
     },
-    /// Buy tokens during presale
+    /// Buy tokens during presale using stablecoins
     /// 
     /// Accounts expected:
     /// 0. `[signer]` The buyer
@@ -67,13 +68,54 @@ pub enum VCoinInstruction {
     /// 3. `[writable]` The buyer's token account
     /// 4. `[signer]` The authority that can mint tokens
     /// 5. `[]` The token program (SPL Token-2022)
-    /// 6. `[]` The system program
-    /// 7. `[writable]` The treasury account
-    /// 8. `[]` The clock sysvar
-    BuyTokens {
-        /// Amount in USD (as u64 with 6 decimals precision)
-        amount_usd: u64,
+    /// 6. `[writable]` The buyer's stablecoin token account (source)
+    /// 7. `[writable]` The development treasury stablecoin account (receives 50%)
+    /// 8. `[writable]` The locked treasury stablecoin account (receives 50%)
+    /// 9. `[]` The stablecoin token program
+    /// 10. `[]` The stablecoin mint account
+    /// 11. `[]` The clock sysvar
+    BuyTokensWithStablecoin {
+        /// Amount in stablecoin token units
+        amount: u64,
     },
+    /// Add supported stablecoin to presale
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The presale state account
+    /// 2. `[]` The stablecoin mint to add
+    AddSupportedStablecoin,
+    /// Mark token as launched and set refund availability
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The presale state account
+    /// 2. `[]` The clock sysvar
+    LaunchToken,
+    /// Claim refund after the refund availability date (3 months post-launch)
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The buyer claiming refund
+    /// 1. `[writable]` The presale state account
+    /// 2. `[writable]` The buyer's stablecoin token account (destination)
+    /// 3. `[writable]` The locked treasury stablecoin account (source)
+    /// 4. `[]` The locked treasury authority (PDA)
+    /// 5. `[]` The stablecoin token program
+    /// 6. `[]` The stablecoin mint
+    /// 7. `[]` The clock sysvar
+    ClaimRefund,
+    /// Withdraw remaining locked funds after refund period ends
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The presale state account
+    /// 2. `[writable]` The locked treasury stablecoin account (source)
+    /// 3. `[writable]` The destination treasury stablecoin account
+    /// 4. `[]` The locked treasury authority (PDA)
+    /// 5. `[]` The stablecoin token program
+    /// 6. `[]` The stablecoin mint
+    /// 7. `[]` The clock sysvar
+    WithdrawLockedFunds,
     /// Initialize vesting
     /// 
     /// Accounts expected:
@@ -169,8 +211,9 @@ pub enum VCoinInstruction {
     /// 
     /// Accounts expected:
     /// 0. `[]` The controller state account
-    /// 1. `[]` The price oracle account
+    /// 1. `[]` The primary price oracle account
     /// 2. `[]` The clock sysvar
+    /// 3. `[]` (Optional) The backup price oracle account
     UpdateOraclePrice,
     /// Execute Autonomous Mint
     /// 
@@ -181,6 +224,7 @@ pub enum VCoinInstruction {
     /// 3. `[writable]` The destination account to receive newly minted tokens
     /// 4. `[]` The token program
     /// 5. `[]` The clock sysvar
+    /// 6. `[]` The price oracle account
     ExecuteAutonomousMint,
     /// Execute Autonomous Burn
     /// 
@@ -188,9 +232,11 @@ pub enum VCoinInstruction {
     /// 0. `[writable]` The controller state account
     /// 1. `[writable]` The mint account
     /// 2. `[]` The mint authority PDA
-    /// 3. `[writable]` The token account to burn tokens from
-    /// 4. `[]` The token program
-    /// 5. `[]` The clock sysvar
+    /// 3. `[writable]` The burn treasury token account to burn tokens from (must be owned by burn treasury PDA)
+    /// 4. `[]` The burn treasury PDA (derived from mint)
+    /// 5. `[]` The token program
+    /// 6. `[]` The clock sysvar
+    /// 7. `[]` The price oracle account
     ExecuteAutonomousBurn,
     /// Permanently Disable Program Upgrades
     /// 
@@ -201,6 +247,92 @@ pub enum VCoinInstruction {
     /// 3. `[]` The system program
     /// 4. `[]` The BPF Upgradeable Loader program
     PermanentlyDisableUpgrades,
+    /// Deposit tokens to burn treasury
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The depositor (token holder)
+    /// 1. `[writable]` The depositor's token account
+    /// 2. `[writable]` The burn treasury token account
+    /// 3. `[]` The controller state account
+    /// 4. `[]` The mint account
+    /// 5. `[]` The token program
+    DepositToBurnTreasury {
+        /// Amount of tokens to deposit
+        amount: u64,
+    },
+    /// Initialize Burn Treasury
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The payer for account creation
+    /// 1. `[]` The controller state account
+    /// 2. `[]` The mint account
+    /// 3. `[]` The burn treasury PDA
+    /// 4. `[writable]` The burn treasury token account (to be created)
+    /// 5. `[]` The token program
+    /// 6. `[]` The system program
+    /// 7. `[]` The rent sysvar
+    InitializeBurnTreasury,
+    /// Expand Presale Account
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The presale state account
+    /// 2. `[]` The system program
+    /// 3. `[]` The rent sysvar
+    ExpandPresaleAccount {
+        /// Additional number of buyers to allocate space for
+        additional_buyers: u32,
+    },
+    /// Initialize Upgrade Timelock
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The current upgrade authority
+    /// 1. `[writable]` The timelock state account (PDA)
+    /// 2. `[]` The program account for this program
+    /// 3. `[]` The program data account for this program
+    /// 4. `[]` The system program
+    /// 5. `[]` The BPF Upgradeable Loader program
+    InitializeUpgradeTimelock {
+        /// Timelock duration in seconds (default 7 days)
+        timelock_duration: i64,
+    },
+    /// Propose Program Upgrade
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The current upgrade authority
+    /// 1. `[writable]` The timelock state account (PDA)
+    /// 2. `[]` The program account for this program
+    /// 3. `[]` The program data account for this program
+    /// 4. `[]` The BPF Upgradeable Loader program
+    /// 5. `[]` The clock sysvar
+    ProposeUpgrade,
+    /// Execute Program Upgrade
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The current upgrade authority
+    /// 1. `[writable]` The timelock state account (PDA)
+    /// 2. `[writable]` The program account for this program
+    /// 3. `[writable]` The program data account for this program
+    /// 4. `[writable]` The buffer account containing the new program
+    /// 5. `[]` The BPF Upgradeable Loader program
+    /// 6. `[]` The clock sysvar
+    /// 7. `[]` Rent sysvar
+    ExecuteUpgrade {
+        /// Buffer account containing the new program
+        buffer: Pubkey,
+    },
+    /// Claim Refund from Development Treasury
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The buyer claiming refund
+    /// 1. `[writable]` The presale state account
+    /// 2. `[writable]` The buyer's stablecoin token account (destination)
+    /// 3. `[writable]` The development treasury stablecoin account (source)
+    /// 4. `[signer]` The authority (presale owner who must approve dev refunds)
+    /// 5. `[]` The stablecoin token program
+    /// 6. `[]` The stablecoin mint
+    /// 7. `[]` The clock sysvar
+    ClaimDevFundRefund,
 }
 
 /// Parameters for initializing a token
@@ -585,7 +717,7 @@ impl VCoinInstruction {
 
         let accounts = vec![
             AccountMeta::new_readonly(Pubkey::default(), false), // Controller state account
-            AccountMeta::new_readonly(Pubkey::default(), false), // Price oracle account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Primary price oracle account
             AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
         ];
 
@@ -604,12 +736,13 @@ impl VCoinInstruction {
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new_readonly(Pubkey::default(), false), // Controller state account
-            AccountMeta::new_readonly(Pubkey::default(), false), // Mint account
+            AccountMeta::new(Pubkey::default(), false),          // Controller state account
+            AccountMeta::new(Pubkey::default(), false),          // Mint account
             AccountMeta::new_readonly(Pubkey::default(), false), // Mint authority PDA
-            AccountMeta::new(Pubkey::default(), false),            // Destination account
+            AccountMeta::new(Pubkey::default(), false),          // Destination account
             AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
             AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+            AccountMeta::new_readonly(Pubkey::default(), false), // Price oracle account
         ];
 
         Ok(Instruction {
@@ -630,9 +763,11 @@ impl VCoinInstruction {
             AccountMeta::new(Pubkey::default(), false),          // Controller state account
             AccountMeta::new(Pubkey::default(), false),          // Mint account
             AccountMeta::new_readonly(Pubkey::default(), false), // Mint authority PDA
-            AccountMeta::new(Pubkey::default(), false),          // Token account to burn from
+            AccountMeta::new(Pubkey::default(), false),          // Burn treasury token account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Burn treasury PDA
             AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
             AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+            AccountMeta::new_readonly(Pubkey::default(), false), // Price oracle account
         ];
 
         Ok(Instruction {
@@ -658,6 +793,177 @@ impl VCoinInstruction {
             AccountMeta::new_readonly(*program_data_account, false),         // Program data account
             AccountMeta::new_readonly(system_program::id(), false),            // System program
             AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new DepositToBurnTreasury instruction
+    pub fn deposit_to_burn_treasury(
+        program_id: &Pubkey,
+        depositor: &Pubkey,
+        depositor_token_account: &Pubkey,
+        burn_treasury_token_account: &Pubkey,
+        controller_state_account: &Pubkey,
+        mint: &Pubkey,
+        amount: u64,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::DepositToBurnTreasury {
+            amount,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new(depositor, true),                  // Depositor (signer)
+            AccountMeta::new(depositor_token_account, false),   // Depositor's token account
+            AccountMeta::new(burn_treasury_token_account, false), // Burn treasury token account
+            AccountMeta::new(controller_state_account, false),    // Controller state account
+            AccountMeta::new(mint, false),                        // Mint account
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new InitializeBurnTreasury instruction
+    pub fn initialize_burn_treasury(
+        program_id: &Pubkey,
+        payer: &Pubkey,
+        controller_state_account: &Pubkey,
+        mint: &Pubkey,
+        burn_treasury_token_account: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::InitializeBurnTreasury;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new(payer, true),                  // Payer (signer)
+            AccountMeta::new(controller_state_account, false),    // Controller state account
+            AccountMeta::new(mint, false),                        // Mint account
+            AccountMeta::new(burn_treasury_token_account, false), // Burn treasury token account
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+            AccountMeta::new_readonly(system_program::id(), false), // System program
+            AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false), // Rent sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new ExpandPresaleAccount instruction
+    pub fn expand_presale_account(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        presale: &Pubkey,
+        additional_buyers: u32,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ExpandPresaleAccount {
+            additional_buyers,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),           // Authority (signer)
+            AccountMeta::new(*presale, false),                     // Presale state account
+            AccountMeta::new_readonly(system_program::id(), false), // System program
+            AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false), // Rent sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new InitializeUpgradeTimelock instruction
+    pub fn initialize_upgrade_timelock(
+        program_id: &Pubkey,
+        current_upgrade_authority: &Pubkey,
+        program_account: &Pubkey,
+        program_data_account: &Pubkey,
+        timelock_duration: i64,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::InitializeUpgradeTimelock {
+            timelock_duration,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
+            AccountMeta::new_readonly(*program_account, false),            // Program account
+            AccountMeta::new_readonly(*program_data_account, false),         // Program data account
+            AccountMeta::new_readonly(system_program::id(), false),            // System program
+            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new ProposeUpgrade instruction
+    pub fn propose_upgrade(
+        program_id: &Pubkey,
+        current_upgrade_authority: &Pubkey,
+        program_account: &Pubkey,
+        program_data_account: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ProposeUpgrade;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
+            AccountMeta::new_readonly(*program_account, false),            // Program account
+            AccountMeta::new_readonly(*program_data_account, false),         // Program data account
+            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
+            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new ExecuteUpgrade instruction
+    pub fn execute_upgrade(
+        program_id: &Pubkey,
+        current_upgrade_authority: &Pubkey,
+        program_account: &Pubkey,
+        program_data_account: &Pubkey,
+        buffer: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ExecuteUpgrade {
+            buffer: *buffer,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
+            AccountMeta::new(*program_account, false),            // Program account
+            AccountMeta::new(*program_data_account, false),         // Program data account
+            AccountMeta::new(*buffer, false),                        // Buffer account
+            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
+            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+            AccountMeta::new_readonly(system_program::id(), false), // Rent sysvar
         ];
 
         Ok(Instruction {

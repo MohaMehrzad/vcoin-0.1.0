@@ -4,8 +4,7 @@ use solana_program::{
     clock::Clock,
     entrypoint::ProgramResult,
     msg,
-    program::invoke,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -21,12 +20,20 @@ use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use spl_token_2022::state::Mint;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_associated_token_account::instruction::create_associated_token_account;
+use std::str::FromStr;
+use pyth_sdk_solana::state::{ProductAccount, PriceAccount};
+// Import Switchboard V2 SDK
+use switchboard_v2::{AggregatorAccountData, SwitchboardDecimal};
 
 use crate::{
     error::VCoinError,
     instruction::VCoinInstruction,
-    state::{PresaleState, TokenMetadata, VestingState, VestingBeneficiary, AutonomousSupplyController},
+    state::{PresaleState, TokenMetadata, VestingState, VestingBeneficiary, AutonomousSupplyController, UpgradeTimelock},
 };
+
+// Add at the top of the file after existing imports:
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Parameters for initializing a presale
 pub struct InitializePresaleParams {
@@ -49,6 +56,79 @@ pub struct InitializeVestingParams {
 
 /// Program state handler.
 pub struct Processor;
+
+// Define constants for clarity and consistency
+/// USD price precision (6 decimals for microUSD)
+pub const USD_DECIMALS: u32 = 6;
+
+// Oracle freshness thresholds (in seconds)
+pub mod oracle_freshness {
+    // Standard freshness for price updates (3 hours)
+    pub const STANDARD_FRESHNESS: i64 = 10_800; // 3 hours in seconds
+    
+    // Strict freshness for economic decisions (mint/burn) (1 hour)
+    pub const STRICT_FRESHNESS: i64 = 3_600; // 1 hour in seconds
+    
+    // Maximum staleness after which data is considered completely invalid (24 hours)
+    pub const MAX_STALENESS: i64 = 86_400; // 24 hours in seconds
+    
+    // Transaction processing timeout (5 minutes)
+    pub const TRANSACTION_TIMEOUT: i64 = 300; // 5 minutes in seconds
+    
+    // Refund processing window (30 days)
+    pub const REFUND_WINDOW: i64 = 30 * 24 * 60 * 60; // 30 days in seconds
+    
+    // Dev fund refund delay (1 year)
+    pub const DEV_FUND_REFUND_DELAY: i64 = 365 * 24 * 60 * 60; // 1 year in seconds
+}
+
+// Add constants for security limits
+/// Maximum price change percentage allowed in a single update (50% = 5000 basis points)
+pub const MAX_PRICE_CHANGE_BPS: u64 = 5000;
+
+/// Maximum confidence interval as percentage of price (5% = 500 basis points)
+pub const MAX_CONFIDENCE_INTERVAL_BPS: u64 = 500;
+
+/// Add reentrancy guard to protect against reentrancy attacks
+pub struct ReentrancyGuard {
+    locked: Rc<RefCell<bool>>,
+}
+
+impl ReentrancyGuard {
+    pub fn new() -> Self {
+        Self {
+            locked: Rc::new(RefCell::new(false)),
+        }
+    }
+
+    pub fn lock<F, T>(&self, func: F) -> Result<T, ProgramError>
+    where
+        F: FnOnce() -> Result<T, ProgramError>,
+    {
+        // Check if already locked (reentrant call)
+        if *self.locked.borrow() {
+            msg!("Reentrancy detected!");
+            return Err(VCoinError::ReentrancyDetected.into());
+        }
+        
+        // Lock
+        *self.locked.borrow_mut() = true;
+        
+        // Execute function
+        let result = func();
+        
+        // Unlock even if function failed
+        *self.locked.borrow_mut() = false;
+        
+        result
+    }
+}
+
+// Initialize a static reentrancy guard
+lazy_static::lazy_static! {
+    static ref REENTRANCY_GUARD: ReentrancyGuard = ReentrancyGuard::new();
+}
+
 impl Processor {
     /// Process a VCoin instruction
     pub fn process(
@@ -60,6 +140,7 @@ impl Processor {
             return Err(VCoinError::InvalidInstructionData.into());
         }
 
+        // Use the reentrancy guard for all sensitive instructions
         let instruction_tag = instruction_data[0];
         match instruction_tag {
             0 => {
@@ -103,17 +184,70 @@ impl Processor {
                 }
             },
             2 => {
-                msg!("Instruction: Buy Tokens");
+                msg!("Instruction: Buy Tokens With Stablecoin");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
-                if let VCoinInstruction::BuyTokens { amount_usd } = instruction {
-                    Self::process_buy_tokens(program_id, accounts, amount_usd)
+                if let VCoinInstruction::BuyTokensWithStablecoin { amount } = instruction {
+                    // Apply reentrancy protection to token purchase
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_buy_tokens_with_stablecoin(program_id, accounts, amount)
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
             3 => {
+                msg!("Instruction: Add Supported Stablecoin");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::AddSupportedStablecoin = instruction {
+                    Self::process_add_supported_stablecoin(program_id, accounts)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            4 => {
+                msg!("Instruction: Launch Token");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::LaunchToken = instruction {
+                    Self::process_launch_token(program_id, accounts)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            5 => {
+                msg!("Instruction: Claim Refund");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::ClaimRefund = instruction {
+                    // Apply reentrancy protection to refund claim
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_claim_refund(program_id, accounts)
+                    })?
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            6 => {
+                msg!("Instruction: Withdraw Locked Funds");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::WithdrawLockedFunds = instruction {
+                    // Apply reentrancy protection to locked funds withdrawal
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_withdraw_locked_funds(program_id, accounts)
+                    })?
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            7 => {
                 msg!("Instruction: Initialize Vesting");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
@@ -130,7 +264,7 @@ impl Processor {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            4 => {
+            8 => {
                 msg!("Instruction: Add Vesting Beneficiary");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
@@ -141,18 +275,21 @@ impl Processor {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            5 => {
+            9 => {
                 msg!("Instruction: Release Vested Tokens");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
                 if let VCoinInstruction::ReleaseVestedTokens { beneficiary } = instruction {
-                    Self::process_release_vested_tokens(program_id, accounts, beneficiary)
+                    // Apply reentrancy protection to token release
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_release_vested_tokens(program_id, accounts, beneficiary)
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            6 => {
+            10 => {
                 msg!("Instruction: Update Token Metadata");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
@@ -163,7 +300,7 @@ impl Processor {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            7 => {
+            11 => {
                 msg!("Instruction: Set Transfer Fee");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
@@ -174,69 +311,75 @@ impl Processor {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            8 => {
+            12 => {
                 msg!("Instruction: End Presale");
                 Self::process_end_presale(program_id, accounts)
             },
-            9 => {
+            13 => {
                 msg!("Instruction: Initialize Autonomous Controller");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
                 if let VCoinInstruction::InitializeAutonomousController { initial_price, max_supply } = instruction {
-                    Self::process_initialize_autonomous_controller(
-                        program_id,
-                        accounts,
-                        initial_price,
-                        max_supply,
-                    )
+                    // Apply reentrancy protection
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_initialize_autonomous_controller(
+                            program_id,
+                            accounts,
+                            initial_price,
+                            max_supply,
+                        )
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            10 => {
+            14 => {
                 msg!("Instruction: Update Oracle Price");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
                 if let VCoinInstruction::UpdateOraclePrice = instruction {
-                    Self::process_update_oracle_price(
-                        program_id,
-                        accounts,
-                    )
+                    // Apply reentrancy protection
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_update_oracle_price(
+                            program_id,
+                            accounts,
+                        )
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            11 => {
+            15 => {
                 msg!("Instruction: Execute Autonomous Mint");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
                 if let VCoinInstruction::ExecuteAutonomousMint = instruction {
-                    Self::process_execute_autonomous_mint(
-                        program_id,
-                        accounts,
-                    )
+                    // Apply reentrancy protection to autonomous mint
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_execute_autonomous_mint(program_id, accounts)
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            12 => {
+            16 => {
                 msg!("Instruction: Execute Autonomous Burn");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
                 
                 if let VCoinInstruction::ExecuteAutonomousBurn = instruction {
-                    Self::process_execute_autonomous_burn(
-                        program_id,
-                        accounts,
-                    )
+                    // Apply reentrancy protection to autonomous burn
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_execute_autonomous_burn(program_id, accounts)
+                    })?
                 } else {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
-            13 => {
+            17 => {
                 msg!("Instruction: Permanently Disable Upgrades");
                 let instruction = VCoinInstruction::try_from_slice(instruction_data)
                     .map_err(|_| VCoinError::InvalidInstructionData)?;
@@ -250,6 +393,86 @@ impl Processor {
                     Err(VCoinError::InvalidInstruction.into())
                 }
             },
+            18 => {
+                msg!("Instruction: Deposit To Burn Treasury");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::DepositToBurnTreasury { amount } = instruction {
+                    Self::process_deposit_to_burn_treasury(program_id, accounts, amount)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            19 => {
+                msg!("Instruction: Initialize Burn Treasury");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::InitializeBurnTreasury = instruction {
+                    Self::process_initialize_burn_treasury(program_id, accounts)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            20 => {
+                msg!("Instruction: Expand Presale Account");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::ExpandPresaleAccount { additional_buyers } = instruction {
+                    Self::process_expand_presale_account(program_id, accounts, additional_buyers)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            21 => {
+                msg!("Instruction: Initialize Upgrade Timelock");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::InitializeUpgradeTimelock { timelock_duration } = instruction {
+                    Self::process_initialize_upgrade_timelock(program_id, accounts, timelock_duration)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            22 => {
+                msg!("Instruction: Propose Upgrade");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::ProposeUpgrade = instruction {
+                    Self::process_propose_upgrade(program_id, accounts)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            23 => {
+                msg!("Instruction: Execute Upgrade");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::ExecuteUpgrade { buffer } = instruction {
+                    Self::process_execute_upgrade(program_id, accounts, buffer)
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
+            24 => {
+                msg!("Instruction: Claim Dev Fund Refund");
+                let instruction = VCoinInstruction::try_from_slice(instruction_data)
+                    .map_err(|_| VCoinError::InvalidInstructionData)?;
+                
+                if let VCoinInstruction::ClaimDevFundRefund = instruction {
+                    // Apply reentrancy protection to refund claim
+                    REENTRANCY_GUARD.lock(|| {
+                        Self::process_claim_dev_fund_refund(program_id, accounts)
+                    })?
+                } else {
+                    Err(VCoinError::InvalidInstruction.into())
+                }
+            },
             _ => {
                 msg!("Instruction: Unknown");
                 Err(VCoinError::InvalidInstruction.into())
@@ -257,791 +480,164 @@ impl Processor {
         }
     }
 
-    /// Process InitializeToken instruction
-    fn process_initialize_token(
+    /// Process SetTransferFee instruction with a hard 5% limit
+    pub fn process_set_transfer_fee(
         program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        name: String,
-        symbol: String,
-        decimals: u8,
-        initial_supply: u64,
-        transfer_fee_basis_points: Option<u16>,
-        maximum_fee_rate: Option<u8>,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        let system_program_info = next_account_info(account_info_iter)?;
-        let rent_info = next_account_info(account_info_iter)?;
-        let metadata_info = next_account_info(account_info_iter)?;
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Get rent
-        let rent = Rent::from_account_info(rent_info)?;
-
-        // Create mint account
-        msg!("Creating mint account...");
-        invoke(
-            &system_instruction::create_account(
-                authority_info.key,
-                mint_info.key,
-                rent.minimum_balance(Mint::LEN),
-                Mint::LEN as u64,
-                token_program_info.key,
-            ),
-            &[
-                authority_info.clone(),
-                mint_info.clone(),
-                system_program_info.clone(),
-            ],
-        )?;
-
-        // Initialize transfer fee config for Token-2022
-        msg!("Initializing transfer fee config...");
-        
-        // Use provided values or defaults
-        let fee_basis_points = transfer_fee_basis_points.unwrap_or(500); // Default 5%
-        let max_fee_rate = maximum_fee_rate.unwrap_or(1); // Default 1% of supply
-        let maximum_fee = initial_supply * (max_fee_rate as u64) / 100;
-        
-        invoke(
-            &initialize_transfer_fee_config(
-                token_program_info.key,
-                mint_info.key,
-                Some(authority_info.key), // fee authority
-                Some(authority_info.key), // withdraw authority
-                fee_basis_points, // configurable transfer fee basis points
-                maximum_fee, // configurable maximum fee
-            )?,
-            &[
-                mint_info.clone(),
-                authority_info.clone(),
-                token_program_info.clone(),
-            ],
-        )?;
-
-        // Initialize mint
-        msg!("Initializing mint...");
-        invoke(
-            &initialize_mint(
-                token_program_info.key,
-                mint_info.key,
-                authority_info.key,
-                None, // No freeze authority to prevent locking user funds
-                decimals,
-            )?,
-            &[
-                mint_info.clone(),
-                rent_info.clone(),
-                token_program_info.clone(),
-            ],
-        )?;
-
-        // Create and initialize metadata account
-        msg!("Creating metadata account...");
-        invoke(
-            &system_instruction::create_account(
-                authority_info.key,
-                metadata_info.key,
-                rent.minimum_balance(TokenMetadata::get_size(name.len(), symbol.len(), "".len())),
-                TokenMetadata::get_size(name.len(), symbol.len(), "".len()) as u64,
-                program_id,
-            ),
-            &[
-                authority_info.clone(),
-                metadata_info.clone(),
-                system_program_info.clone(),
-            ],
-        )?;
-
-        // Create metadata
-        let token_metadata = TokenMetadata {
-            is_initialized: true,
-            authority: *authority_info.key,
-            mint: *mint_info.key,
-            name,
-            symbol,
-            uri: String::new(),
-        };
-
-        token_metadata.serialize(&mut *metadata_info.data.borrow_mut())?;
-
-        // Create associated token account for authority if it doesn't exist
-        let authority_token_account = get_associated_token_address_with_program_id(
-            authority_info.key,
-            mint_info.key,
-            token_program_info.key,
-        );
-
-        // Check if account exists
-        if !Self::account_exists(&authority_token_account) {
-            msg!("Creating associated token account for authority...");
-            invoke(
-                &create_associated_token_account(
-                    authority_info.key,
-                    authority_info.key,
-                    mint_info.key,
-                    token_program_info.key,
-                ),
-                &[
-                    authority_info.clone(),
-                    mint_info.clone(),
-                    token_program_info.clone(),
-                    system_program_info.clone(),
-                ],
-            )?;
-        }
-
-        // Mint initial supply to authority
-        if initial_supply > 0 {
-            msg!("Minting initial supply to authority...");
-            invoke(
-                &mint_to(
-                    token_program_info.key,
-                    mint_info.key,
-                    &authority_token_account,
-                    authority_info.key,
-                    &[],
-                    initial_supply,
-                )?,
-                &[
-                    mint_info.clone(),
-                    token_program_info.clone(),
-                    authority_info.clone(),
-                ],
-            )?;
-        }
-
-        msg!("Token initialized successfully!");
-        Ok(())
-    }
-
-    /// Process InitializePresale instruction
-    fn process_initialize_presale(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        params: InitializePresaleParams,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let presale_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let treasury_info = next_account_info(account_info_iter)?;
-        let system_program_info = next_account_info(account_info_iter)?;
-        let rent_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Validate presale parameters
-        if params.end_time <= params.start_time {
-            return Err(VCoinError::InvalidPresaleParameters.into());
-        }
-
-        if params.hard_cap < params.soft_cap || params.hard_cap == 0 || params.soft_cap == 0 || params.token_price == 0 {
-            return Err(VCoinError::InvalidPresaleParameters.into());
-        }
-
-        // Set soft cap to 1 million USD (with 6 decimals: 1,000,000 * 10^6)
-        let soft_cap = 1_000_000_000_000u64;
-        let params = InitializePresaleParams {
-            start_time: params.start_time,
-            end_time: params.end_time,
-            token_price: params.token_price,
-            hard_cap: params.hard_cap,
-            soft_cap,
-            min_purchase: params.min_purchase,
-            max_purchase: params.max_purchase,
-        };
-
-        // Get rent
-        let rent = Rent::from_account_info(rent_info)?;
-
-        // Create presale account
-        msg!("Creating presale account...");
-        invoke(
-            &system_instruction::create_account(
-                authority_info.key,
-                presale_info.key,
-                rent.minimum_balance(PresaleState::get_size()),
-                PresaleState::get_size() as u64,
-                program_id,
-            ),
-            &[
-                authority_info.clone(),
-                presale_info.clone(),
-                system_program_info.clone(),
-            ],
-        )?;
-
-        // Initialize presale state
-        let presale_state = PresaleState {
-            is_initialized: true,
-            authority: *authority_info.key,
-            mint: *mint_info.key,
-            treasury: *treasury_info.key,
-            start_time: params.start_time,
-            end_time: params.end_time,
-            token_price: params.token_price,
-            hard_cap: params.hard_cap,
-            soft_cap: params.soft_cap,
-            min_purchase: params.min_purchase,
-            max_purchase: params.max_purchase,
-            total_tokens_sold: 0,
-            total_usd_raised: 0,
-            num_buyers: 0,
-            is_active: true,
-            has_ended: false,
-            buyer_pubkeys: Vec::new(),
-        };
-
-        presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
-
-        msg!("Presale initialized successfully!");
-        Ok(())
-    }
-
-    /// Process BuyTokens instruction
-    fn process_buy_tokens(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        amount_usd: u64,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let buyer_info = next_account_info(account_info_iter)?;
-        let presale_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let buyer_token_account_info = next_account_info(account_info_iter)?;
-        let authority_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        let system_program_info = next_account_info(account_info_iter)?;
-        let treasury_info = next_account_info(account_info_iter)?;
-        let clock_info = next_account_info(account_info_iter)?;
-
-        // Check if buyer signed this transaction
-        if !buyer_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        // Load presale state
-        let mut presale_state = PresaleState::try_from_slice(&presale_info.data.borrow())?;
-
-        // Verify presale account ownership
-        if presale_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Check if presale is initialized
-        if !presale_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Check if presale is active
-        if !presale_state.is_active {
-            return Err(VCoinError::PresaleNotActive.into());
-        }
-
-        // Check if presale has ended
-        if presale_state.has_ended {
-            return Err(VCoinError::PresaleEnded.into());
-        }
-
-        // Check if mint matches
-        if presale_state.mint != *mint_info.key {
-            return Err(VCoinError::InvalidMint.into());
-        }
-
-        // Check if treasury matches
-        if presale_state.treasury != *treasury_info.key {
-            return Err(VCoinError::InvalidTreasury.into());
-        }
-
-        // Get current time
-        let clock = Clock::from_account_info(clock_info)?;
-        let current_time = clock.unix_timestamp;
-
-        // Check if presale has started
-        if current_time < presale_state.start_time {
-            return Err(VCoinError::PresaleNotStarted.into());
-        }
-
-        // Check if presale has ended by time
-        if current_time > presale_state.end_time {
-            return Err(VCoinError::PresaleEnded.into());
-        }
-
-        // Check minimum purchase
-        if amount_usd < presale_state.min_purchase {
-            return Err(VCoinError::BelowMinimumPurchase.into());
-        }
-
-        // Check maximum purchase
-        if amount_usd > presale_state.max_purchase {
-            return Err(VCoinError::ExceedsMaximumPurchase.into());
-        }
-
-        // Check hard cap
-        if presale_state.total_usd_raised.checked_add(amount_usd).ok_or(VCoinError::CalculationError)? > presale_state.hard_cap {
-            return Err(VCoinError::HardCapReached.into());
-        }
-
-        // Calculate tokens to mint (amount_usd / token_price * 10^decimals)
-        let tokens_to_mint = amount_usd
-            .checked_mul(10_u64.pow(9)) // Assuming 9 decimals
-            .ok_or(VCoinError::CalculationError)?
-            .checked_div(presale_state.token_price)
-            .ok_or(VCoinError::CalculationError)?;
-
-        // Transfer funds to treasury
-        invoke(
-            &system_instruction::transfer(buyer_info.key, treasury_info.key, amount_usd),
-            &[
-                buyer_info.clone(),
-                treasury_info.clone(),
-                system_program_info.clone(),
-            ],
-        )?;
-
-        // Mint tokens to buyer
-        invoke(
-            &mint_to(
-                token_program_info.key,
-                mint_info.key,
-                buyer_token_account_info.key,
-                authority_info.key,
-                &[],
-                tokens_to_mint,
-            )?,
-            &[
-                mint_info.clone(),
-                buyer_token_account_info.clone(),
-                authority_info.clone(),
-                token_program_info.clone(),
-            ],
-        )?;
-
-        // Update presale state
-        presale_state.total_tokens_sold = presale_state
-            .total_tokens_sold
-            .checked_add(tokens_to_mint)
-            .ok_or(VCoinError::CalculationError)?;
-
-        presale_state.total_usd_raised = presale_state
-            .total_usd_raised
-            .checked_add(amount_usd)
-            .ok_or(VCoinError::CalculationError)?;
-
-        // Check if buyer has previously participated by looking through buyer_pubkeys
-        let buyer_key = *buyer_info.key;
-        let is_new_buyer = !presale_state.buyer_pubkeys.contains(&buyer_key);
-
-        // Only increment buyer count for unique buyers
-        if is_new_buyer {
-            presale_state.num_buyers = presale_state.num_buyers
-                .checked_add(1)
-                .ok_or(VCoinError::CalculationError)?;
-            
-            // Add buyer to the list of buyers
-            presale_state.buyer_pubkeys.push(buyer_key);
-        }
-
-        // Save updated presale state
-        presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
-
-        msg!("Tokens bought successfully!");
-        Ok(())
-    }
-
-    /// Process InitializeVesting instruction
-    fn process_initialize_vesting(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        params: InitializeVestingParams,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let vesting_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let system_program_info = next_account_info(account_info_iter)?;
-        let rent_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Validate vesting parameters
-        if params.release_interval <= 0 {
-            return Err(VCoinError::InvalidVestingParameters.into());
-        }
-
-        if params.num_releases == 0 {
-            return Err(VCoinError::InvalidVestingParameters.into());
-        }
-
-        // Get rent
-        let rent = Rent::from_account_info(rent_info)?;
-
-        // Create vesting account
-        msg!("Creating vesting account...");
-        invoke(
-            &system_instruction::create_account(
-                authority_info.key,
-                vesting_info.key,
-                rent.minimum_balance(VestingState::get_size()),
-                VestingState::get_size() as u64,
-                program_id,
-            ),
-            &[
-                authority_info.clone(),
-                vesting_info.clone(),
-                system_program_info.clone(),
-            ],
-        )?;
-
-        // Initialize vesting state
-        let vesting_state = VestingState {
-            is_initialized: true,
-            authority: *authority_info.key,
-            mint: *mint_info.key,
-            total_tokens: params.total_tokens,
-            total_allocated: 0,
-            total_released: 0,
-            start_time: params.start_time,
-            release_interval: params.release_interval,
-            num_releases: params.num_releases,
-            last_release_time: 0,
-            num_beneficiaries: 0,
-            beneficiaries: Vec::new(),
-        };
-
-        vesting_state.serialize(&mut *vesting_info.data.borrow_mut())?;
-
-        msg!("Vesting initialized successfully!");
-        Ok(())
-    }
-
-    /// Process AddVestingBeneficiary instruction
-    fn process_add_vesting_beneficiary(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        beneficiary: Pubkey,
-        amount: u64,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let vesting_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Load vesting state
-        let mut vesting_state = VestingState::try_from_slice(&vesting_info.data.borrow())?;
-
-        // Verify vesting account ownership
-        if vesting_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Check if vesting is initialized
-        if !vesting_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Check if authority matches
-        if vesting_state.authority != *authority_info.key {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Check if there's enough unallocated tokens
-        let new_total_allocated = vesting_state.total_allocated.checked_add(amount)
-            .ok_or(VCoinError::CalculationError)?;
-
-        if new_total_allocated > vesting_state.total_tokens {
-            return Err(VCoinError::InsufficientTokens.into());
-        }
-
-        // Check for duplicate beneficiary
-        if vesting_state.beneficiaries.iter().any(|b| b.beneficiary == beneficiary) {
-            return Err(VCoinError::BeneficiaryAlreadyExists.into());
-        }
-
-        // Add beneficiary
-        let vesting_beneficiary = VestingBeneficiary {
-            beneficiary,
-            total_amount: amount,
-            released_amount: 0,
-        };
-
-        vesting_state.beneficiaries.push(vesting_beneficiary);
-        vesting_state.num_beneficiaries = vesting_state.num_beneficiaries.checked_add(1)
-            .ok_or(VCoinError::CalculationError)?;
-        vesting_state.total_allocated = new_total_allocated;
-
-        // Save updated vesting state
-        vesting_state.serialize(&mut *vesting_info.data.borrow_mut())?;
-
-        msg!("Beneficiary added successfully!");
-        Ok(())
-    }
-
-    /// Process ReleaseVestedTokens instruction
-    fn process_release_vested_tokens(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        beneficiary: Pubkey,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let vesting_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let beneficiary_token_account_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        let clock_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        // Load vesting state
-        let mut vesting_state = VestingState::try_from_slice(&vesting_info.data.borrow())?;
-
-        // Verify vesting account ownership
-        if vesting_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Check if vesting is initialized
-        if !vesting_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Check if mint matches
-        if vesting_state.mint != *mint_info.key {
-            return Err(VCoinError::InvalidMint.into());
-        }
-
-        // Get current time
-        let clock = Clock::from_account_info(clock_info)?;
-        let current_time = clock.unix_timestamp;
-
-        // Check if vesting has started
-        if current_time < vesting_state.start_time {
-            return Err(VCoinError::VestingNotStarted.into());
-        }
-
-        // Find beneficiary
-        let beneficiary_index = vesting_state.beneficiaries.iter().position(|b| b.beneficiary == beneficiary)
-            .ok_or(VCoinError::BeneficiaryNotFound)?;
-
-        // Calculate releasable amount
-        let elapsed_time = current_time - vesting_state.start_time;
-        let periods_passed = elapsed_time.checked_div(vesting_state.release_interval)
-            .ok_or(VCoinError::CalculationError)?;
-        let periods_passed = std::cmp::min(periods_passed as u8, vesting_state.num_releases);
-
-        let beneficiary_data = &vesting_state.beneficiaries[beneficiary_index];
-        let total_releasable = beneficiary_data.total_amount.checked_mul(periods_passed as u64)
-            .ok_or(VCoinError::CalculationError)?
-            .checked_div(vesting_state.num_releases as u64)
-            .ok_or(VCoinError::CalculationError)?;
-
-        let amount_to_release = total_releasable.checked_sub(beneficiary_data.released_amount)
-            .ok_or(VCoinError::CalculationError)?;
-
-        // Check if there are tokens to release
-        if amount_to_release == 0 {
-            return Err(VCoinError::NoTokensDue.into());
-        }
-
-        // Mint tokens to beneficiary
-        invoke(
-            &mint_to(
-                token_program_info.key,
-                mint_info.key,
-                beneficiary_token_account_info.key,
-                authority_info.key,
-                &[],
-                amount_to_release,
-            )?,
-            &[
-                mint_info.clone(),
-                beneficiary_token_account_info.clone(),
-                authority_info.clone(),
-                token_program_info.clone(),
-            ],
-        )?;
-
-        // Update vesting state
-        vesting_state.beneficiaries[beneficiary_index].released_amount = 
-            vesting_state.beneficiaries[beneficiary_index].released_amount
-            .checked_add(amount_to_release)
-            .ok_or(VCoinError::CalculationError)?;
-
-        vesting_state.total_released = vesting_state.total_released
-            .checked_add(amount_to_release)
-            .ok_or(VCoinError::CalculationError)?;
-
-        vesting_state.last_release_time = current_time;
-
-        // Save updated vesting state
-        vesting_state.serialize(&mut *vesting_info.data.borrow_mut())?;
-
-        msg!("Tokens released successfully!");
-        Ok(())
-    }
-
-    /// Process UpdateTokenMetadata instruction
-    fn process_update_token_metadata(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        name: Option<String>,
-        symbol: Option<String>,
-        uri: Option<String>,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
-        let metadata_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        // Load metadata
-        let mut token_metadata = TokenMetadata::try_from_slice(&metadata_info.data.borrow())?;
-
-        // Verify metadata account ownership
-        if metadata_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Check if metadata is initialized
-        if !token_metadata.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Check if authority matches
-        if token_metadata.authority != *authority_info.key {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Check if mint matches
-        if token_metadata.mint != *mint_info.key {
-            return Err(VCoinError::InvalidMint.into());
-        }
-
-        // Update metadata
-        if let Some(name) = name {
-            token_metadata.name = name;
-        }
-
-        if let Some(symbol) = symbol {
-            token_metadata.symbol = symbol;
-        }
-
-        if let Some(uri) = uri {
-            token_metadata.uri = uri;
-        }
-
-        // Save updated metadata
-        token_metadata.serialize(&mut *metadata_info.data.borrow_mut())?;
-
-        msg!("Token metadata updated successfully!");
-        Ok(())
-    }
-
-    /// Process SetTransferFee instruction
-    fn process_set_transfer_fee(
-        _program_id: &Pubkey,
         accounts: &[AccountInfo],
         transfer_fee_basis_points: u16,
         maximum_fee: u64,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
-        let authority_info = next_account_info(account_info_iter)?;
+        let fee_authority_info = next_account_info(account_info_iter)?;
         let mint_info = next_account_info(account_info_iter)?;
         let token_program_info = next_account_info(account_info_iter)?;
-
-        // Check if authority signed this transaction
-        if !authority_info.is_signer {
+        
+        // Verify token program is Token-2022
+        if *token_program_info.key != TOKEN_2022_PROGRAM_ID {
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+        
+        // Verify fee authority is a signer
+        if !fee_authority_info.is_signer {
             return Err(VCoinError::Unauthorized.into());
         }
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
-            return Err(ProgramError::IncorrectProgramId);
+        
+        // Validate the transfer fee basis points (max 1% = 100 basis points)
+        if transfer_fee_basis_points > 100 {
+            msg!("Transfer fee cannot exceed 1% (100 basis points), attempted: {}", transfer_fee_basis_points);
+            return Err(VCoinError::InvalidFeeAmount.into());
         }
 
-        // Ensure transfer fee is capped at 10% (1000 basis points)
-        if transfer_fee_basis_points > 1000 {
-            return Err(VCoinError::ExceedsMaximumFee.into());
-        }
-
-        // Set the transfer fee
+        // Call the SPL Token-2022 program to set the transfer fee
         invoke(
             &set_transfer_fee(
                 token_program_info.key,
                 mint_info.key,
-                authority_info.key,
-                &[], // Empty signer array
+                fee_authority_info.key,
                 transfer_fee_basis_points,
                 maximum_fee,
             )?,
             &[
                 mint_info.clone(),
-                authority_info.clone(),
+                fee_authority_info.clone(),
                 token_program_info.clone(),
             ],
         )?;
 
-        msg!("Transfer fee set successfully!");
+        msg!("Transfer fee set to {} basis points, maximum fee {} units", 
+             transfer_fee_basis_points, maximum_fee);
         Ok(())
     }
 
-    /// Process EndPresale instruction
-    fn process_end_presale(
+    /// Process ExpandPresaleAccount instruction
+    /// Allows expanding the presale account to accommodate more buyers
+    fn process_expand_presale_account(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        additional_buyers: u32,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let authority_info = next_account_info(account_info_iter)?;
+        let presale_info = next_account_info(account_info_iter)?;
+        let system_program_info = next_account_info(account_info_iter)?;
+        let rent_info = next_account_info(account_info_iter)?;
+
+        // Verify authority signed the transaction
+        if !authority_info.is_signer {
+            msg!("Authority must sign transaction");
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Verify presale account ownership
+        if presale_info.owner != program_id {
+            msg!("Presale account not owned by program");
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+
+        // Load presale state
+        let mut presale_state = PresaleState::try_from_slice(&presale_info.data.borrow())?;
+
+        // Verify presale is initialized
+        if !presale_state.is_initialized {
+            msg!("Presale not initialized");
+            return Err(VCoinError::NotInitialized.into());
+        }
+
+        // Verify authority is presale owner
+        if presale_state.authority != *authority_info.key {
+            msg!("Only the presale authority can expand the account");
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Calculate the current account size
+        let current_size = presale_info.data_len();
+
+        // Calculate the new size needed
+        let total_buyers = presale_state.num_buyers.checked_add(additional_buyers)
+            .ok_or(VCoinError::CalculationError)?;
+        
+        // Safety check for extremely large buyer numbers
+        if total_buyers > 1_000_000 {
+            msg!("Expansion would exceed maximum supported buyers (1,000,000)");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+        
+        let new_size = PresaleState::get_size_for_buyers(total_buyers as usize);
+        
+        msg!("Expanding presale account from {} to {} bytes to support {} more buyers", 
+             current_size, new_size, additional_buyers);
+
+        // Resize the account
+        if new_size > current_size {
+            // Calculate the additional lamports needed for rent-exemption
+            let rent = Rent::from_account_info(rent_info)?;
+            let current_minimum_balance = rent.minimum_balance(current_size);
+            let new_minimum_balance = rent.minimum_balance(new_size);
+            
+            let lamports_needed = new_minimum_balance.saturating_sub(current_minimum_balance);
+            
+            if lamports_needed > 0 {
+                msg!("Transferring {} lamports to fund account expansion", lamports_needed);
+                
+                // Transfer the additional lamports
+                invoke(
+                    &solana_program::system_instruction::transfer(
+                        authority_info.key,
+                        presale_info.key,
+                        lamports_needed,
+                    ),
+                    &[
+                        authority_info.clone(),
+                        presale_info.clone(),
+                        system_program_info.clone(),
+                    ],
+                )?;
+            }
+            
+            // Resize the account data
+            presale_info.realloc(new_size, false)?;
+        }
+
+        // Save updated presale state
+        presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
+
+        msg!("Presale account successfully expanded to accommodate {} total buyers", total_buyers);
+        Ok(())
+    }
+
+    /// Process LaunchToken instruction
+    fn process_launch_token(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let authority_info = next_account_info(account_info_iter)?;
         let presale_info = next_account_info(account_info_iter)?;
+        let clock_info = next_account_info(account_info_iter)?;
 
-        // Check if authority signed this transaction
+        // Verify authority signed the transaction
         if !authority_info.is_signer {
+            msg!("Authority must sign transaction");
             return Err(VCoinError::Unauthorized.into());
         }
 
@@ -1050,50 +646,861 @@ impl Processor {
 
         // Verify presale account ownership
         if presale_info.owner != program_id {
+            msg!("Presale account not owned by program");
             return Err(VCoinError::InvalidAccountOwner.into());
         }
 
-        // Check if presale is initialized
-        if !presale_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Check if authority matches
+        // Verify authority is presale owner
         if presale_state.authority != *authority_info.key {
+            msg!("Caller is not the presale authority");
             return Err(VCoinError::Unauthorized.into());
         }
 
-        // Check if presale is already ended
-        if presale_state.has_ended {
-            return Err(VCoinError::PresaleAlreadyEnded.into());
+        // Verify presale is initialized
+        if !presale_state.is_initialized {
+            msg!("Presale is not initialized");
+            return Err(VCoinError::NotInitialized.into());
         }
 
-        // End presale
-        presale_state.is_active = false;
-        presale_state.has_ended = true;
+        // Verify presale has ended
+        let clock = Clock::from_account_info(clock_info)?;
+        let current_time = clock.unix_timestamp;
+        
+        if current_time < presale_state.end_time {
+            msg!("Presale has not ended yet");
+            return Err(VCoinError::PresaleNotEnded.into());
+        }
+
+        // Verify token hasn't already been launched
+        if presale_state.token_launched {
+            msg!("Token has already been launched");
+            return Err(VCoinError::TokenAlreadyLaunched.into());
+        }
+
+        // Set token as launched and calculate refund dates
+        presale_state.token_launched = true;
+        presale_state.launch_timestamp = current_time;
+        
+        // Calculate standard refund availability: launch + 3 months (use constant)
+        let seconds_in_three_months = 90 * 24 * 60 * 60;
+        presale_state.refund_available_timestamp = current_time
+            .checked_add(seconds_in_three_months)
+            .ok_or(VCoinError::CalculationError)?;
+            
+        // Calculate standard refund period end using our new constant
+        presale_state.refund_period_end_timestamp = presale_state.refund_available_timestamp
+            .checked_add(oracle_freshness::REFUND_WINDOW)
+            .ok_or(VCoinError::CalculationError)?;
+        
+        // Calculate dev fund refund availability using our new constant
+        presale_state.dev_refund_available_timestamp = current_time
+            .checked_add(oracle_freshness::DEV_FUND_REFUND_DELAY)
+            .ok_or(VCoinError::CalculationError)?;
+            
+        // Calculate dev fund refund period end using our constant
+        presale_state.dev_refund_period_end_timestamp = presale_state.dev_refund_available_timestamp
+            .checked_add(oracle_freshness::REFUND_WINDOW)
+            .ok_or(VCoinError::CalculationError)?;
+        
+        // Set whether dev funds are refundable (only if softcap wasn't reached)
+        presale_state.dev_funds_refundable = !presale_state.soft_cap_reached;
+        
+        // If softcap was reached, all funds are released for development
+        if presale_state.soft_cap_reached {
+            msg!("Soft cap was reached - all funds released for development");
+        } else {
+            msg!("Soft cap was not reached - additional refunds will be available after 1 year");
+        }
 
         // Save updated presale state
         presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
 
-        msg!("Presale ended successfully!");
+        msg!("Token successfully launched");
         Ok(())
     }
 
-    /// Check if an account exists
-    fn account_exists(_pubkey: &Pubkey) -> bool {
-        // In a real implementation, we would check if the account exists
-        // However, this requires passing in the AccountInfo or Connection
-        // Since this is just a check for creating associated token accounts,
-        // we'll simply return false to ensure the account is created
-        false
+    /// Process UpdateOraclePrice instruction with thorough ownership verification
+    fn process_update_oracle_price(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let controller_info = next_account_info(account_info_iter)?;
+        let primary_oracle_info = next_account_info(account_info_iter)?;
+        let clock_info = next_account_info(account_info_iter)?;
+        
+        // Optional backup oracles (may be multiple)
+        let mut backup_oracle_infos = Vec::new();
+        while account_info_iter.len() > 0 {
+            backup_oracle_infos.push(next_account_info(account_info_iter)?);
+        }
+
+        // Verify controller account ownership
+        if controller_info.owner != program_id {
+            msg!("Controller account not owned by program");
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+
+        // Load controller state
+        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
+
+        // Verify controller is initialized
+        if !controller_state.is_initialized {
+            msg!("Controller not initialized");
+            return Err(VCoinError::NotInitialized.into());
+        }
+
+        // Get current timestamp
+        let clock = Clock::from_account_info(clock_info)?;
+        let current_time = clock.unix_timestamp;
+
+        // Define known oracle program IDs
+        let pyth_program_id = Pubkey::from_str("FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH").unwrap_or_default(); // Pyth mainnet
+        let pyth_devnet_id = Pubkey::from_str("gSbePebfvPy7tRqimPoVecS2UsBvYv46ynrzWocc92s").unwrap_or_default(); // Pyth devnet
+        let switchboard_program_id = Pubkey::from_str("DtmE9D2CSB4L5D6A15mraeEjrGMm6auWVzgaD8hK2tZM").unwrap_or_default(); // Switchboard mainnet
+        let switchboard_devnet_id = Pubkey::from_str("7azgmy1pFXHikv36q1zZASvFq5vFa39TT9NweVugKKTU").unwrap_or_default(); // Switchboard devnet
+
+        // Track oracle success
+        let mut successful_oracles = 0;
+        let mut total_price: u128 = 0;
+        let mut price_count = 0;
+        let mut final_price: u64 = 0;
+        let mut final_confidence: u64 = 0;
+        let mut newest_publish_time: i64 = 0;
+        let mut used_backup = false;
+
+        // Try to parse primary oracle first
+        if primary_oracle_info.owner == &pyth_program_id || primary_oracle_info.owner == &pyth_devnet_id {
+            msg!("Using Pyth oracle for primary price data");
+            
+            match Self::try_get_pyth_price(primary_oracle_info, current_time) {
+                Ok((price, confidence, publish_time)) => {
+                    msg!("Successfully got price from Pyth: {} USD", 
+                         price as f64 / 10f64.powi(USD_DECIMALS as i32));
+                    
+                    total_price = total_price.saturating_add(price as u128);
+                    price_count += 1;
+                    successful_oracles += 1;
+                    newest_publish_time = publish_time;
+                    final_price = price;
+                    final_confidence = confidence;
+                }
+                Err(err) => {
+                    msg!("Failed to get price from primary Pyth oracle: {:?}", err);
+                    // Continue to backup oracles
+                }
+            }
+        } else if primary_oracle_info.owner == &switchboard_program_id || primary_oracle_info.owner == &switchboard_devnet_id {
+            msg!("Using Switchboard oracle for primary price data");
+            
+            match Self::try_get_switchboard_price(primary_oracle_info, current_time) {
+                Ok((price, confidence, publish_time)) => {
+                    msg!("Successfully got price from Switchboard: {} USD", 
+                         price as f64 / 10f64.powi(USD_DECIMALS as i32));
+                    
+                    total_price = total_price.saturating_add(price as u128);
+                    price_count += 1;
+                    successful_oracles += 1;
+                    newest_publish_time = publish_time;
+                    final_price = price;
+                    final_confidence = confidence;
+                }
+                Err(err) => {
+                    msg!("Failed to get price from primary Switchboard oracle: {:?}", err);
+                    // Continue to backup oracles
+                }
+            }
+        } else {
+            msg!("Primary oracle not owned by a recognized oracle provider");
+            msg!("Expected either Pyth or Switchboard");
+            msg!("Found: {}", primary_oracle_info.owner);
+            // Continue to try backup oracles
+        }
+
+        // If primary oracle failed, try the backup oracles
+        if successful_oracles == 0 && !backup_oracle_infos.is_empty() {
+            msg!("Primary oracle failed, trying {} backup oracles", backup_oracle_infos.len());
+            used_backup = true;
+            
+            for (i, oracle_info) in backup_oracle_infos.iter().enumerate() {
+                if oracle_info.owner == &pyth_program_id || oracle_info.owner == &pyth_devnet_id {
+                    msg!("Trying backup Pyth oracle #{}", i + 1);
+                    
+                    match Self::try_get_pyth_price(oracle_info, current_time) {
+                        Ok((price, confidence, publish_time)) => {
+                            msg!("Successfully got price from backup Pyth oracle: {} USD", 
+                                 price as f64 / 10f64.powi(USD_DECIMALS as i32));
+                            
+                            total_price = total_price.saturating_add(price as u128);
+                            price_count += 1;
+                            successful_oracles += 1;
+                            
+                            if publish_time > newest_publish_time {
+                                newest_publish_time = publish_time;
+                                final_price = price;
+                                final_confidence = confidence;
+                            }
+                            
+                            // Continue checking other oracles for aggregation
+                        }
+                        Err(err) => {
+                            msg!("Failed to get price from backup Pyth oracle #{}: {:?}", i + 1, err);
+                            // Continue to next backup
+                        }
+                    }
+                } else if oracle_info.owner == &switchboard_program_id || oracle_info.owner == &switchboard_devnet_id {
+                    msg!("Trying backup Switchboard oracle #{}", i + 1);
+                    
+                    match Self::try_get_switchboard_price(oracle_info, current_time) {
+                        Ok((price, confidence, publish_time)) => {
+                            msg!("Successfully got price from backup Switchboard oracle: {} USD", 
+                                 price as f64 / 10f64.powi(USD_DECIMALS as i32));
+                            
+                            total_price = total_price.saturating_add(price as u128);
+                            price_count += 1;
+                            successful_oracles += 1;
+                            
+                            if publish_time > newest_publish_time {
+                                newest_publish_time = publish_time;
+                                final_price = price;
+                                final_confidence = confidence;
+                            }
+                            
+                            // Continue checking other oracles for aggregation
+                        }
+                        Err(err) => {
+                            msg!("Failed to get price from backup Switchboard oracle #{}: {:?}", i + 1, err);
+                            // Continue to next backup
+                        }
+                    }
+                } else {
+                    msg!("Backup oracle #{} not owned by a recognized oracle provider: {}", 
+                         i + 1, oracle_info.owner);
+                    // Continue to next backup
+                }
+            }
+        }
+
+        // If we have multiple valid oracle prices, calculate median or average
+        if price_count > 1 {
+            // Calculate the average price from all valid oracles
+            let average_price = total_price.checked_div(price_count as u128)
+                .ok_or(VCoinError::CalculationError)?;
+                
+            if average_price > u64::MAX as u128 {
+                msg!("Average price exceeds u64 max value");
+                return Err(VCoinError::CalculationError.into());
+            }
+            
+            final_price = average_price as u64;
+            msg!("Using average price from {} oracles: {} USD", 
+                 price_count, final_price as f64 / 10f64.powi(USD_DECIMALS as i32));
+        }
+
+        // Verify we successfully got a price
+        if successful_oracles == 0 || final_price == 0 {
+            msg!("No valid price obtained from any oracles");
+            return Err(VCoinError::InvalidOracleData.into());
+        }
+        
+        // Check for price manipulation (excessive change)
+        if controller_state.current_price > 0 {
+            let prev_price = controller_state.current_price;
+            
+            // Calculate the percentage change in basis points (10000 = 100%)
+            let change_bps = if final_price > prev_price {
+                // Price increased
+                final_price.saturating_sub(prev_price)
+                    .saturating_mul(10000)
+                    .saturating_div(prev_price)
+            } else {
+                // Price decreased
+                prev_price.saturating_sub(final_price)
+                    .saturating_mul(10000)
+                    .saturating_div(prev_price)
+            };
+            
+            // Check if change exceeds limit
+            if change_bps > MAX_PRICE_CHANGE_BPS {
+                msg!("Excessive price change detected: {}% (max allowed: {}%)", 
+                     change_bps as f64 / 100.0, 
+                     MAX_PRICE_CHANGE_BPS as f64 / 100.0);
+                return Err(VCoinError::ExcessivePriceChange.into());
+            }
+            
+            msg!("Price change: {}% from previous ${} to new ${}", 
+                 (change_bps as f64 / 100.0),
+                 (prev_price as f64 / 10f64.powi(USD_DECIMALS as i32)),
+                 (final_price as f64 / 10f64.powi(USD_DECIMALS as i32)));
+        }
+        
+        // Update controller state with the new price
+        controller_state.current_price = final_price;
+        controller_state.last_price_update = current_time;
+        
+        // If it's a new year, update the year start price
+        let year_start_timestamp = controller_state.year_start_timestamp;
+        let seconds_in_year = 365 * 24 * 60 * 60; // 365 days
+        
+        if current_time >= year_start_timestamp + seconds_in_year {
+            msg!("Updating year start price for new year period");
+            controller_state.year_start_price = final_price;
+            controller_state.year_start_timestamp = current_time;
+        }
+        
+        // Save updated controller state
+        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
+        
+        msg!("Oracle price successfully updated to {} USD (confidence: {} USD)", 
+             (final_price as f64 / 10f64.powi(USD_DECIMALS as i32)),
+             (final_confidence as f64 / 10f64.powi(USD_DECIMALS as i32)));
+        Ok(())
     }
 
-    /// Derive the mint authority PDA
-    fn derive_mint_authority_pda(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[b"autonomous_mint_authority", mint.as_ref()],
+    /// Helper method to try getting a price from a Pyth oracle
+    fn try_get_pyth_price(
+        oracle_info: &AccountInfo,
+        current_time: i64,
+    ) -> Result<(u64, u64, i64), ProgramError> {
+        match PriceAccount::load(oracle_info) {
+            Ok(price_account) => {
+                // Verify price account is valid
+                if !price_account.is_valid() {
+                    msg!("Pyth price account invalid status");
+                    return Err(VCoinError::InvalidOracleData.into());
+                }
+
+                // Get price and confidence
+                let pyth_price = price_account.get_current_price()
+                    .ok_or(VCoinError::InvalidOracleData)?;
+                
+                // Pyth prices can be negative, but we don't accept negative prices
+                if pyth_price < 0 {
+                    msg!("Negative price from Pyth: {}", pyth_price);
+                    return Err(VCoinError::InvalidOracleData.into());
+                }
+                
+                // Get confidence interval
+                let pyth_confidence = price_account.get_current_conf()
+                    .ok_or(VCoinError::InvalidOracleData)?;
+                
+                // Check confidence relative to price (reject if too uncertain)
+                let confidence_bps = (pyth_confidence as u64)
+                    .checked_mul(10000)
+                    .and_then(|v| v.checked_div(pyth_price as u64))
+                    .unwrap_or(u64::MAX);
+                
+                if confidence_bps > MAX_CONFIDENCE_INTERVAL_BPS {
+                    msg!("Price confidence interval too large: {}% of price", 
+                         confidence_bps as f64 / 100.0);
+                    return Err(VCoinError::LowConfidencePriceData.into());
+                }
+                
+                // Check for freshness (prices must be recent)
+                let publish_time = price_account.timestamp;
+                let time_since_update = current_time.saturating_sub(publish_time);
+                
+                if time_since_update > oracle_freshness::MAX_STALENESS {
+                    msg!("Oracle data critically stale: {} seconds old", time_since_update);
+                    return Err(VCoinError::CriticallyStaleOracleData.into());
+                } else if time_since_update > oracle_freshness::STANDARD_FRESHNESS {
+                    msg!("Oracle data moderately stale: {} seconds old", time_since_update);
+                    // Warning only, still usable but not for critical operations
+                }
+                
+                // Convert price to u64 with USD_DECIMALS (6) precision
+                // Pyth prices are stored as fixed-point values with expo determining the scale
+                let exponent = price_account.expo;
+                let scale_factor = 10u64.pow((USD_DECIMALS as i32 - exponent) as u32);
+                
+                let price = (pyth_price as u64).saturating_mul(scale_factor);
+                let confidence = (pyth_confidence as u64).saturating_mul(scale_factor);
+                
+                Ok((price, confidence, publish_time))
+            }
+            Err(err) => {
+                msg!("Failed to parse Pyth price account: {}", err);
+                Err(VCoinError::InvalidOracleData.into())
+            }
+        }
+    }
+
+    /// Helper method to try getting a price from a Switchboard oracle
+    fn try_get_switchboard_price(
+        oracle_info: &AccountInfo,
+        current_time: i64,
+    ) -> Result<(u64, u64, i64), ProgramError> {
+        match AggregatorAccountData::new(oracle_info) {
+            Ok(aggregator) => {
+                // Get latest Switchboard result
+                let sb_result = aggregator.get_result()
+                    .map_err(|_| VCoinError::InvalidOracleData)?;
+                    
+                // Check if the value is negative
+                if sb_result.is_negative() {
+                    msg!("Negative price from Switchboard");
+                    return Err(VCoinError::InvalidOracleData.into());
+                }
+                
+                // Convert to u64 with USD_DECIMALS (6) precision
+                let sb_decimal = SwitchboardDecimal::from(sb_result);
+                let price = sb_decimal.to_u64(USD_DECIMALS as u32)
+                    .ok_or(VCoinError::InvalidOracleData)?;
+                
+                // Get confidence interval
+                let sb_std = aggregator.latest_confirmed_round.std_deviation;
+                let confidence = sb_std.to_u64(USD_DECIMALS as u32)
+                    .unwrap_or_default();
+                    
+                // Check confidence percentage
+                let confidence_bps = confidence
+                    .checked_mul(10000)
+                    .and_then(|v| v.checked_div(price))
+                    .unwrap_or(u64::MAX);
+                    
+                if confidence_bps > MAX_CONFIDENCE_INTERVAL_BPS {
+                    msg!("Price confidence interval too large: {}% of price", 
+                         confidence_bps as f64 / 100.0);
+                    return Err(VCoinError::LowConfidencePriceData.into());
+                }
+                
+                // Check for freshness
+                let publish_time = aggregator.latest_confirmed_round.round_open_timestamp as i64;
+                let time_since_update = current_time.saturating_sub(publish_time);
+                
+                if time_since_update > oracle_freshness::MAX_STALENESS {
+                    msg!("Oracle data critically stale: {} seconds old", time_since_update);
+                    return Err(VCoinError::CriticallyStaleOracleData.into());
+                } else if time_since_update > oracle_freshness::STANDARD_FRESHNESS {
+                    msg!("Oracle data moderately stale: {} seconds old", time_since_update);
+                    // Warning only, still usable but not for critical operations
+                }
+                
+                Ok((price, confidence, publish_time))
+            }
+            Err(err) => {
+                msg!("Failed to parse Switchboard aggregator: {:?}", err);
+                Err(VCoinError::InvalidOracleData.into())
+            }
+        }
+    }
+
+    /// Process ExecuteAutonomousBurn instruction with strict authorization controls
+    fn process_execute_autonomous_burn(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let controller_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let mint_authority_info = next_account_info(account_info_iter)?;
+        let burn_treasury_token_account_info = next_account_info(account_info_iter)?;
+        let burn_treasury_authority_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        let clock_info = next_account_info(account_info_iter)?;
+        let oracle_info = next_account_info(account_info_iter)?;
+
+        // Verify controller account ownership
+        if controller_info.owner != program_id {
+            msg!("Controller account not owned by program");
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+
+        // Load controller state
+        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
+
+        // Verify controller is initialized
+        if !controller_state.is_initialized {
+            msg!("Controller not initialized");
+            return Err(VCoinError::NotInitialized.into());
+        }
+
+        // Verify mint matches controller
+        if controller_state.mint != *mint_info.key {
+            msg!("Mint mismatch: expected {}, found {}", 
+                 controller_state.mint, mint_info.key);
+            return Err(VCoinError::InvalidMint.into());
+        }
+
+        // Get current timestamp
+        let clock = Clock::from_account_info(clock_info)?;
+        let current_time = clock.unix_timestamp;
+
+        // Verify mint authority PDA (this is a derived account, not a signer)
+        let (expected_mint_authority, authority_bump) = 
+            Pubkey::find_program_address(&[b"mint_authority", mint_info.key.as_ref()], program_id);
+            
+        if expected_mint_authority != *mint_authority_info.key {
+            msg!("Invalid mint authority PDA: expected {}, found {}", 
+                 expected_mint_authority, mint_authority_info.key);
+            return Err(VCoinError::InvalidMintAuthority.into());
+        }
+
+        // Verify burn treasury authority PDA (this is a derived account, not a signer)
+        let (expected_burn_treasury_authority, burn_treasury_bump) = 
+            Pubkey::find_program_address(&[b"burn_treasury", mint_info.key.as_ref()], program_id);
+            
+        if expected_burn_treasury_authority != *burn_treasury_authority_info.key {
+            msg!("Invalid burn treasury authority: expected {}, found {}", 
+                 expected_burn_treasury_authority, burn_treasury_authority_info.key);
+            return Err(VCoinError::InvalidBurnTreasury.into());
+        }
+
+        // Verify burn treasury token account's owner is the burn treasury authority
+        // This ensures we're only burning from the official treasury account
+        let token_account_data = spl_token_2022::state::Account::unpack(&burn_treasury_token_account_info.data.borrow())?;
+        
+        if token_account_data.owner != expected_burn_treasury_authority {
+            msg!("Burn treasury token account owned by {}, expected {}", 
+                 token_account_data.owner, expected_burn_treasury_authority);
+            return Err(VCoinError::UnauthorizedBurnSource.into());
+        }
+        
+        // Verify mint matches token account's mint
+        if token_account_data.mint != *mint_info.key {
+            msg!("Burn source token account mint mismatch");
+            return Err(VCoinError::InvalidMint.into());
+        }
+        
+        // Verify token program
+        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
+            msg!("Invalid token program: expected Token-2022 program");
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        // Verify oracle is the one registered with controller
+        if *oracle_info.key != controller_state.price_oracle {
+            msg!("Oracle mismatch: expected {}, found {}", 
+                 controller_state.price_oracle, oracle_info.key);
+            return Err(VCoinError::InvalidOracleAccount.into());
+        }
+
+        // Check how long since last price update
+        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        if time_since_update > oracle_freshness::STRICT_FRESHNESS {
+            msg!("Price data too stale for burn operation: {} seconds old", time_since_update);
+            msg!("Autonomous supply operations require data no older than {} seconds", 
+                 oracle_freshness::STRICT_FRESHNESS);
+            return Err(VCoinError::StaleOracleData.into());
+        }
+
+        // Check if supply is already at minimum - if so, don't burn
+        if controller_state.current_supply <= controller_state.min_supply {
+            msg!("Supply is already at minimum threshold (1B tokens), burning not allowed");
+            return Ok(());
+        }
+
+        // Calculate how much to burn based on price changes
+        let burn_amount = match controller_state.calculate_burn_amount() {
+            Some(amount) => amount,
+            None => {
+                msg!("Error calculating burn amount");
+                return Err(VCoinError::CalculationError.into());
+            }
+        };
+
+        // If burn amount is zero, nothing to do
+        if burn_amount == 0 {
+            msg!("No burning required based on current economic conditions");
+            return Ok(());
+        }
+
+        // Check if burn treasury has enough tokens
+        if token_account_data.amount < burn_amount {
+            msg!("Burn treasury has insufficient tokens: {} < {}", 
+                 token_account_data.amount, burn_amount);
+            
+            // Burn what we can instead of failing
+            let actual_burn_amount = token_account_data.amount;
+            msg!("Adjusting burn amount to available balance: {}", actual_burn_amount);
+            
+            if actual_burn_amount == 0 {
+                msg!("Burn treasury is empty, nothing to burn");
+                return Ok(());
+            }
+            
+            // Proceed with adjusted amount
+            execute_burn(
+                mint_info,
+                burn_treasury_token_account_info,
+                burn_treasury_authority_info,
+                token_program_info,
+                actual_burn_amount,
+                burn_treasury_bump,
+                program_id,
+                mint_info.key,
+            )?;
+            
+            // Update controller state with the new supply
+            controller_state.current_supply = controller_state.current_supply
+                .checked_sub(actual_burn_amount)
+                .ok_or(VCoinError::CalculationError)?;
+        } else {
+            // We have enough tokens, burn the calculated amount
+            msg!("Burning {} tokens from burn treasury", burn_amount);
+            
+            execute_burn(
+                mint_info,
+                burn_treasury_token_account_info,
+                burn_treasury_authority_info,
+                token_program_info,
+                burn_amount,
+                burn_treasury_bump,
+                program_id,
+                mint_info.key,
+            )?;
+            
+            // Update controller state with the new supply
+            controller_state.current_supply = controller_state.current_supply
+                .checked_sub(burn_amount)
+                .ok_or(VCoinError::CalculationError)?;
+        }
+
+        // Update last burn timestamp
+        controller_state.last_mint_timestamp = current_time;
+        
+        // Save updated controller state
+        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
+
+        msg!("Autonomous burn completed successfully, new supply: {}", 
+             controller_state.current_supply);
+        Ok(())
+    }
+    
+    /// Helper function to execute burn with treasury authority signature
+    fn execute_burn(
+        mint_info: &AccountInfo,
+        source_info: &AccountInfo,
+        authority_info: &AccountInfo,
+        token_program_info: &AccountInfo,
+        amount: u64,
+        authority_bump: u8,
+        program_id: &Pubkey,
+        mint_key: &Pubkey,
+    ) -> ProgramResult {
+        msg!("Executing burn of {} tokens", amount);
+        
+        // Create burn instruction
+        let burn_ix = spl_token_2022::instruction::burn(
+            token_program_info.key,
+            source_info.key,
+            mint_info.key,
+            authority_info.key,
+            &[],
+            amount,
+        )?;
+        
+        // Sign and invoke burn instruction with PDA authority
+        invoke_signed(
+            &burn_ix,
+            &[
+                source_info.clone(),
+                mint_info.clone(),
+                authority_info.clone(),
+                token_program_info.clone(),
+            ],
+            &[
+                &[b"burn_treasury", mint_key.as_ref(), &[authority_bump]],
+            ],
+        )?;
+        
+        msg!("Burn transaction successful");
+        Ok(())
+    }
+
+    /// Check if an account exists on-chain
+    fn account_exists(pubkey: &Pubkey) -> bool {
+        // Use the Solana runtime to check if the account exists and has lamports
+        match solana_program::program::get_account_info_and_rent_exempt_balance(pubkey) {
+            Ok((_, lamports)) => lamports > 0,
+            Err(_) => false,
+        }
+    }
+    
+    /// Check if a token account exists for a given owner and mint
+    fn token_account_exists(
+        owner: &Pubkey, 
+        mint: &Pubkey, 
+        token_program: &Pubkey
+    ) -> bool {
+        let token_account = get_associated_token_address_with_program_id(
+            owner,
+            mint,
+            token_program,
+        );
+        Self::account_exists(&token_account)
+    }
+
+    /// Process ExecuteAutonomousMint instruction with secure authorization
+    fn process_execute_autonomous_mint(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let controller_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let mint_authority_info = next_account_info(account_info_iter)?;
+        let destination_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        let clock_info = next_account_info(account_info_iter)?;
+        let oracle_info = next_account_info(account_info_iter)?;
+
+        // Verify controller account ownership
+        if controller_info.owner != program_id {
+            msg!("Controller account not owned by program");
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+
+        // Load controller state
+        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
+
+        // Verify controller is initialized
+        if !controller_state.is_initialized {
+            msg!("Controller not initialized");
+            return Err(VCoinError::NotInitialized.into());
+        }
+
+        // Verify mint matches controller
+        if controller_state.mint != *mint_info.key {
+            msg!("Mint mismatch: expected {}, found {}", 
+                 controller_state.mint, mint_info.key);
+            return Err(VCoinError::InvalidMint.into());
+        }
+
+        // Get current timestamp
+        let clock = Clock::from_account_info(clock_info)?;
+        let current_time = clock.unix_timestamp;
+
+        // Verify mint authority PDA (this is a derived account, not a signer)
+        let (expected_mint_authority, mint_authority_bump) = 
+            Pubkey::find_program_address(&[b"mint_authority", mint_info.key.as_ref()], program_id);
+            
+        if expected_mint_authority != *mint_authority_info.key {
+            msg!("Invalid mint authority PDA: expected {}, found {}", 
+                 expected_mint_authority, mint_authority_info.key);
+            return Err(VCoinError::InvalidMintAuthority.into());
+        }
+        
+        // Verify token program
+        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
+            msg!("Invalid token program: expected Token-2022 program");
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        // Verify destination account is a valid token account
+        let destination_data = spl_token_2022::state::Account::unpack(&destination_info.data.borrow())
+            .map_err(|_| {
+                msg!("Destination is not a valid token account");
+                VCoinError::InvalidAccountOwner
+            })?;
+            
+        // Verify destination account's mint matches
+        if destination_data.mint != *mint_info.key {
+            msg!("Destination token account mint mismatch");
+            return Err(VCoinError::InvalidMint.into());
+        }
+
+        // Verify oracle is the one registered with controller
+        if *oracle_info.key != controller_state.price_oracle {
+            msg!("Oracle mismatch: expected {}, found {}", 
+                 controller_state.price_oracle, oracle_info.key);
+            return Err(VCoinError::InvalidOracleAccount.into());
+        }
+
+        // Check how long since last price update
+        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        if time_since_update > oracle_freshness::STRICT_FRESHNESS {
+            msg!("Price data too stale for mint operation: {} seconds old", time_since_update);
+            msg!("Autonomous supply operations require data no older than {} seconds", 
+                 oracle_freshness::STRICT_FRESHNESS);
+            return Err(VCoinError::StaleOracleData.into());
+        }
+
+        // Calculate how much to mint based on price changes
+        let mint_amount = match controller_state.calculate_mint_amount() {
+            Some(amount) => amount,
+            None => {
+                msg!("Error calculating mint amount");
+                return Err(VCoinError::CalculationError.into());
+            }
+        };
+
+        // If mint amount is zero, nothing to do
+        if mint_amount == 0 {
+            msg!("No minting required based on current economic conditions");
+            return Ok(());
+        }
+
+        // We can mint the full calculated amount
+        msg!("Minting {} tokens to destination", mint_amount);
+        
+        // Execute the mint operation
+        execute_mint(
+            mint_info,
+            destination_info,
+            mint_authority_info,
+            token_program_info,
+            mint_amount,
+            mint_authority_bump,
             program_id,
-        )
+            mint_info.key,
+        )?;
+        
+        // Update controller state with the new supply
+        controller_state.current_supply = controller_state.current_supply
+            .checked_add(mint_amount)
+            .ok_or(VCoinError::CalculationError)?;
+
+        // Update last mint timestamp
+        controller_state.last_mint_timestamp = current_time;
+        
+        // Save updated controller state
+        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
+
+        msg!("Autonomous mint completed successfully, new supply: {}", 
+             controller_state.current_supply);
+        Ok(())
+    }
+    
+    /// Helper function to execute mint with the mint authority signature
+    fn execute_mint(
+        mint_info: &AccountInfo,
+        destination_info: &AccountInfo,
+        authority_info: &AccountInfo,
+        token_program_info: &AccountInfo,
+        amount: u64,
+        authority_bump: u8,
+        program_id: &Pubkey,
+        mint_key: &Pubkey,
+    ) -> ProgramResult {
+        msg!("Executing mint of {} tokens", amount);
+        
+        // Create mint-to instruction
+        let mint_ix = spl_token_2022::instruction::mint_to(
+            token_program_info.key,
+            mint_info.key,
+            destination_info.key,
+            authority_info.key,
+            &[],
+            amount,
+        )?;
+        
+        // Sign and invoke mint instruction with PDA authority
+        invoke_signed(
+            &mint_ix,
+            &[
+                mint_info.clone(),
+                destination_info.clone(),
+                authority_info.clone(),
+                token_program_info.clone(),
+            ],
+            &[
+                &[b"mint_authority", mint_key.as_ref(), &[authority_bump]],
+            ],
+        )?;
+        
+        msg!("Mint transaction successful");
+        Ok(())
     }
 
     /// Process InitializeAutonomousController instruction
@@ -1112,35 +1519,42 @@ impl Processor {
         let token_program_info = next_account_info(account_info_iter)?;
         let rent_info = next_account_info(account_info_iter)?;
 
-        // Check if initializer signed this transaction
+        // Verify initializer signed the transaction
         if !initializer_info.is_signer {
+            msg!("Initializer must sign transaction");
             return Err(VCoinError::Unauthorized.into());
         }
 
-        // Prevent re-initialization if controller is already initialized
-        if controller_info.try_data_len()? > 0 {
-            let existing_controller = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
-            if existing_controller.is_initialized {
-                return Err(VCoinError::AlreadyInitialized.into());
-            }
-        }
-
-        // Check if the token program is Token-2022
-        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
+        // Verify system program
+        if system_program_info.key != &solana_program::system_program::ID {
+            msg!("Invalid system program");
             return Err(ProgramError::IncorrectProgramId);
         }
 
-        // Get rent
-        let rent = Rent::from_account_info(rent_info)?;
+        // Verify token program
+        if token_program_info.key != &TOKEN_2022_PROGRAM_ID {
+            msg!("Invalid token program: expected Token-2022 program");
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        // Check if controller is already initialized
+        if controller_info.data_len() > 0 {
+            msg!("Controller account already exists");
+            return Err(VCoinError::AlreadyInitialized.into());
+        }
 
         // Create controller account
-        msg!("Creating autonomous controller account...");
+        let rent = Rent::from_account_info(rent_info)?;
+        let controller_size = AutonomousSupplyController::get_size();
+        let lamports = rent.minimum_balance(controller_size);
+
+        // Create the controller account
         invoke(
-            &system_instruction::create_account(
+            &solana_program::system_instruction::create_account(
                 initializer_info.key,
                 controller_info.key,
-                rent.minimum_balance(AutonomousSupplyController::get_size()),
-                AutonomousSupplyController::get_size() as u64,
+                lamports,
+                controller_size as u64,
                 program_id,
             ),
             &[
@@ -1150,446 +1564,72 @@ impl Processor {
             ],
         )?;
 
-        // Get current time
+        // Get mint info
+        let mint_data = spl_token_2022::state::Mint::unpack(&mint_info.data.borrow())?;
+        
+        // Calculate the minimum supply (1B tokens with appropriate decimals)
+        let min_supply = 1_000_000_000u64
+            .checked_mul(10u64.pow(mint_data.decimals as u32))
+            .ok_or(VCoinError::CalculationError)?;
+            
+        // Calculate the high supply threshold (5B tokens with appropriate decimals)
+        let high_supply_threshold = 5_000_000_000u64
+            .checked_mul(10u64.pow(mint_data.decimals as u32))
+            .ok_or(VCoinError::CalculationError)?;
+
+        // Generate mint authority PDA
+        let (mint_authority, mint_authority_bump) = 
+            Pubkey::find_program_address(&[b"mint_authority", mint_info.key.as_ref()], program_id);
+            
+        // Generate burn treasury PDA
+        let (burn_treasury, burn_treasury_bump) = 
+            Pubkey::find_program_address(&[b"burn_treasury", mint_info.key.as_ref()], program_id);
+
+        // Get the current clock
         let clock = Clock::get()?;
         let current_time = clock.unix_timestamp;
 
-        // Generate mint authority PDA
-        let (mint_authority, mint_authority_bump) = Self::derive_mint_authority_pda(program_id, mint_info.key);
-
-        // Check current supply
-        let mint_data = mint_info.try_borrow_data()?;
-        let mint = Mint::unpack(&mint_data)?;
-        let current_supply = mint.supply;
-        drop(mint_data);
-
-        // The provided max_supply should be the initial max supply (1B)
-        let initial_max_supply = max_supply;
-        
-        // Absolute maximum supply is fixed at 5B (with 9 decimals)
-        let absolute_max_supply = 5_000_000_000_000_000_000u64; // 5B with 9 decimals
-
-        // Validate the initial max supply is not greater than absolute max
-        if initial_max_supply > absolute_max_supply {
-            return Err(VCoinError::InvalidSupplyParameters.into());
-        }
-
-        // Initialize controller state
+        // Initialize controller state with optimized parameters
         let controller_state = AutonomousSupplyController {
             is_initialized: true,
             mint: *mint_info.key,
             price_oracle: *oracle_info.key,
-            initial_price,
+            initial_price: initial_price,
             year_start_price: initial_price,
             current_price: initial_price,
             last_price_update: current_time,
             year_start_timestamp: current_time,
             last_mint_timestamp: 0, // Never minted yet
-            current_supply,
-            initial_max_supply,
-            absolute_max_supply,
-            mint_authority,
-            mint_authority_bump,
+            current_supply: mint_data.supply, // Initial supply from mint
+            token_decimals: mint_data.decimals,
+            min_supply: min_supply,
+            high_supply_threshold: high_supply_threshold,
+            mint_authority: mint_authority,
+            mint_authority_bump: mint_authority_bump,
+            burn_treasury: burn_treasury,
+            burn_treasury_bump: burn_treasury_bump,
+            // Conservative parameters
+            min_growth_for_mint_bps: 500, // 5% minimum growth for minting
+            min_decline_for_burn_bps: 500, // 5% minimum decline for burning
+            medium_growth_mint_rate_bps: 500, // Mint 5% on medium growth
+            high_growth_mint_rate_bps: 1000, // Mint 10% on high growth
+            medium_decline_burn_rate_bps: 500, // Burn 5% on medium decline
+            high_decline_burn_rate_bps: 1000, // Burn 10% on high decline
+            high_growth_threshold_bps: 1000, // 10% is high growth
+            high_decline_threshold_bps: 1000, // 10% is high decline
+            extreme_growth_threshold_bps: 3000, // 30% is extreme growth
+            extreme_decline_threshold_bps: 3000, // 30% is extreme decline
+            post_cap_mint_rate_bps: 200, // 2% mint rate after reaching high supply
+            post_cap_burn_rate_bps: 200, // 2% burn rate after reaching high supply
         };
 
-        // Save controller state
+        // Serialize the controller state
         controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
 
-        // Transfer mint authority to the PDA - THIS IS PERMANENT AND IRREVERSIBLE
-        msg!("WARNING: Transferring mint authority permanently to the autonomous controller");
-        invoke(
-            &spl_token_2022::instruction::set_authority(
-                token_program_info.key,
-                mint_info.key,
-                Some(&mint_authority),
-                spl_token_2022::instruction::AuthorityType::MintTokens,
-                initializer_info.key,
-                &[],
-            )?,
-            &[
-                mint_info.clone(),
-                initializer_info.clone(),
-                token_program_info.clone(),
-            ],
-        )?;
-        
-        msg!("IMPORTANT: Mint authority has been permanently transferred to the algorithm!");
-        msg!("No human, including the initializer, can mint or burn tokens manually!");
-        msg!("Autonomous controller initialized successfully!");
+        msg!("Autonomous Supply Controller initialized successfully");
+        msg!("Initial price: {}, Current supply: {}", initial_price, mint_data.supply);
+        msg!("Minimum supply (1B tokens): {}", min_supply);
+        msg!("High supply threshold (5B tokens): {}", high_supply_threshold);
         Ok(())
     }
-
-    /// Process UpdateOraclePrice instruction
-    fn process_update_oracle_price(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let controller_info = next_account_info(account_info_iter)?;
-        let oracle_info = next_account_info(account_info_iter)?;
-        let clock_info = next_account_info(account_info_iter)?;
-
-        // Verify controller account ownership
-        if controller_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Load controller state
-        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
-
-        // Verify oracle address matches the one set during initialization (cannot be changed)
-        if controller_state.price_oracle != *oracle_info.key {
-            return Err(VCoinError::InvalidOracleAccount.into());
-        }
-
-        // Get current time
-        let clock = Clock::from_account_info(clock_info)?;
-        let current_time = clock.unix_timestamp;
-
-        // Get price from oracle (simplified - in a real implementation, you'd parse actual oracle data)
-        // For now, we'll just use a sample value for demonstration
-        let oracle_data = oracle_info.try_borrow_data()?;
-        let new_price = u64::from_le_bytes([
-            oracle_data[0], oracle_data[1], oracle_data[2], oracle_data[3],
-            oracle_data[4], oracle_data[5], oracle_data[6], oracle_data[7],
-        ]);
-
-        // Anti-manipulation check: Prevent extreme price swings in short time periods
-        // Only allow max 20% change per day to prevent oracle manipulation
-        if controller_state.last_price_update > 0 && 
-           (current_time - controller_state.last_price_update) < 86400 { // Less than a day
-            
-            // Calculate percentage change
-            let price_change_abs = if new_price > controller_state.current_price {
-                new_price - controller_state.current_price
-            } else {
-                controller_state.current_price - new_price
-            };
-
-            // Calculate percentage (20% = 2000 basis points)
-            let change_percentage = price_change_abs
-                .checked_mul(10000)
-                .ok_or(VCoinError::CalculationError)?
-                .checked_div(controller_state.current_price)
-                .ok_or(VCoinError::CalculationError)?;
-
-            // If change exceeds 20% in a day, reject it as potential manipulation
-            if change_percentage > 2000 { // 20% limit
-                msg!("WARNING: Price change exceeds daily limit (20%), rejecting update as potential manipulation");
-                return Err(VCoinError::PriceManipulationDetected.into());
-            }
-        }
-
-        // Update controller with new price
-        msg!("Updating price from {} to {}", controller_state.current_price, new_price);
-        controller_state.update_price(new_price, current_time);
-
-        // Check if it's time for annual evaluation
-        if controller_state.is_annual_evaluation_time(current_time) {
-            // If a full year has passed, start a new year period
-            controller_state.start_new_year_period(current_time);
-            msg!("Annual evaluation period completed, starting new year with reference price: {}", new_price);
-        }
-
-        // Save updated controller state
-        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
-
-        msg!("Oracle price updated successfully!");
-        Ok(())
-    }
-
-    /// Process ExecuteAutonomousMint instruction
-    fn process_execute_autonomous_mint(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let controller_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let mint_authority_info = next_account_info(account_info_iter)?;
-        let destination_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        let clock_info = next_account_info(account_info_iter)?;
-
-        // Verify controller account ownership belongs to the program (not manipulable)
-        if controller_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Verify the controller is initialized
-        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
-        if !controller_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Verify mint matches the one set during initialization (cannot be changed)
-        if controller_state.mint != *mint_info.key {
-            return Err(VCoinError::InvalidMint.into());
-        }
-
-        // Verify mint authority PDA is the correct one derived by the program
-        let (expected_mint_authority, bump) = Self::derive_mint_authority_pda(program_id, mint_info.key);
-        if expected_mint_authority != *mint_authority_info.key || bump != controller_state.mint_authority_bump {
-            return Err(VCoinError::InvalidMintAuthority.into());
-        }
-
-        // Get current time from the Solana clock (cannot be manipulated)
-        let clock = Clock::from_account_info(clock_info)?;
-        let current_time = clock.unix_timestamp;
-
-        // Verify a full year has passed since last mint/burn (enforced time lock)
-        if !controller_state.can_mint_based_on_time(current_time) {
-            msg!("Cannot mint: annual time lock is still active");
-            return Err(VCoinError::TooEarlyForMinting.into());
-        }
-
-        // Ensure price data is fresh (within 7 days)
-        if current_time - controller_state.last_price_update > 604800 { // 7 days in seconds
-            msg!("Cannot mint: price data is stale, please update from oracle first");
-            return Err(VCoinError::StaleOracleData.into());
-        }
-
-        // Calculate mint amount based on price growth using the algorithm rules
-        // This calculation is deterministic and based solely on verifiable on-chain data
-        let mint_amount = controller_state.calculate_mint_amount()
-            .ok_or(VCoinError::CalculationError)?;
-
-        // If no minting is needed based on algorithm rules, return early
-        if mint_amount == 0 {
-            msg!("Minting criteria not met: either insufficient price growth or maximum supply reached");
-            return Ok(());
-        }
-
-        // Log detailed metrics for transparency and verification
-        let growth_bps = controller_state.calculate_price_growth_bps()
-            .ok_or(VCoinError::CalculationError)?;
-        
-        msg!("MINT VERIFICATION: Price growth: {}%, Current supply: {}, Minting: {} tokens ({}% of supply)", 
-            growth_bps as f64 / 100.0,
-            controller_state.current_supply,
-            mint_amount,
-            (mint_amount * 10000 / controller_state.current_supply) as f64 / 100.0
-        );
-
-        // Create PDA signer seeds - only the program can sign through this PDA
-        let signer_seeds = &[
-            b"autonomous_mint_authority",
-            mint_info.key.as_ref(),
-            &[controller_state.mint_authority_bump],
-        ];
-
-        // Execute mint instruction with PDA signature
-        msg!("Executing autonomous mint of {} tokens", mint_amount);
-        invoke_signed(
-            &spl_token_2022::instruction::mint_to(
-                token_program_info.key,
-                mint_info.key,
-                destination_info.key,
-                mint_authority_info.key,
-                &[],
-                mint_amount,
-            )?,
-            &[
-                mint_info.clone(),
-                destination_info.clone(),
-                mint_authority_info.clone(),
-                token_program_info.clone(),
-            ],
-            &[signer_seeds],
-        )?;
-
-        // Update controller state with new supply
-        controller_state.current_supply = controller_state.current_supply
-            .checked_add(mint_amount)
-            .ok_or(VCoinError::CalculationError)?;
-
-        // Update timestamp for time-lock enforcement
-        controller_state.last_mint_timestamp = current_time;
-
-        // Start a new year period after minting (reset evaluation window)
-        controller_state.start_new_year_period(current_time);
-
-        // Save updated controller state
-        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
-
-        msg!("Autonomous minting completed successfully - HUMAN INTERVENTION WAS NOT INVOLVED");
-        Ok(())
-    }
-
-    /// Process ExecuteAutonomousBurn instruction
-    fn process_execute_autonomous_burn(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let controller_info = next_account_info(account_info_iter)?;
-        let mint_info = next_account_info(account_info_iter)?;
-        let mint_authority_info = next_account_info(account_info_iter)?;
-        let burn_source_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        let clock_info = next_account_info(account_info_iter)?;
-
-        // Verify controller account ownership belongs to the program (not manipulable)
-        if controller_info.owner != program_id {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-
-        // Verify the controller is initialized
-        let mut controller_state = AutonomousSupplyController::try_from_slice(&controller_info.data.borrow())?;
-        if !controller_state.is_initialized {
-            return Err(VCoinError::NotInitialized.into());
-        }
-
-        // Verify mint matches the one set during initialization (cannot be changed)
-        if controller_state.mint != *mint_info.key {
-            return Err(VCoinError::InvalidMint.into());
-        }
-
-        // Verify mint authority PDA is the correct one derived by the program
-        let (expected_mint_authority, bump) = Self::derive_mint_authority_pda(program_id, mint_info.key);
-        if expected_mint_authority != *mint_authority_info.key || bump != controller_state.mint_authority_bump {
-            return Err(VCoinError::InvalidMintAuthority.into());
-        }
-
-        // Get current time from the Solana clock (cannot be manipulated)
-        let clock = Clock::from_account_info(clock_info)?;
-        let current_time = clock.unix_timestamp;
-
-        // Verify a full year has passed since last mint/burn (enforced time lock)
-        if !controller_state.can_mint_based_on_time(current_time) {
-            msg!("Cannot burn: annual time lock is still active");
-            return Err(VCoinError::TooEarlyForBurning.into());
-        }
-
-        // Ensure price data is fresh (within 7 days)
-        if current_time - controller_state.last_price_update > 604800 { // 7 days in seconds
-            msg!("Cannot burn: price data is stale, please update from oracle first");
-            return Err(VCoinError::StaleOracleData.into());
-        }
-
-        // Calculate burn amount based on price decline using the algorithm rules
-        // This calculation is deterministic and based solely on verifiable on-chain data
-        let burn_amount = controller_state.calculate_burn_amount()
-            .ok_or(VCoinError::CalculationError)?;
-
-        // If no burning is needed based on algorithm rules, return early
-        if burn_amount == 0 {
-            msg!("Burning criteria not met: either insufficient price decline or supply near minimum threshold");
-            return Ok(());
-        }
-
-        // Log detailed metrics for transparency and verification
-        let growth_bps = controller_state.calculate_price_growth_bps()
-            .ok_or(VCoinError::CalculationError)?;
-        
-        // Since we're burning, growth is negative
-        let decline_bps = (-growth_bps) as u64;
-        
-        msg!("BURN VERIFICATION: Price decline: {}%, Current supply: {}, Burning: {} tokens ({}% of supply)", 
-            decline_bps as f64 / 100.0,
-            controller_state.current_supply,
-            burn_amount,
-            (burn_amount * 10000 / controller_state.current_supply) as f64 / 100.0
-        );
-
-        // Create PDA signer seeds - only the program can sign through this PDA
-        let signer_seeds = &[
-            b"autonomous_mint_authority",
-            mint_info.key.as_ref(),
-            &[controller_state.mint_authority_bump],
-        ];
-
-        // Execute burn instruction with PDA signature
-        msg!("Executing autonomous burn of {} tokens", burn_amount);
-        invoke_signed(
-            &spl_token_2022::instruction::burn(
-                token_program_info.key,
-                burn_source_info.key,
-                mint_info.key,
-                mint_authority_info.key,
-                &[],
-                burn_amount,
-            )?,
-            &[
-                burn_source_info.clone(),
-                mint_info.clone(),
-                mint_authority_info.clone(),
-                token_program_info.clone(),
-            ],
-            &[signer_seeds],
-        )?;
-
-        // Update controller state with new supply
-        controller_state.current_supply = controller_state.current_supply
-            .checked_sub(burn_amount)
-            .ok_or(VCoinError::CalculationError)?;
-
-        // Update timestamp for time-lock enforcement
-        controller_state.last_mint_timestamp = current_time;
-
-        // Start a new year period after burning (reset evaluation window)
-        controller_state.start_new_year_period(current_time);
-
-        // Save updated controller state
-        controller_state.serialize(&mut *controller_info.data.borrow_mut())?;
-
-        msg!("Autonomous burning completed successfully - HUMAN INTERVENTION WAS NOT INVOLVED");
-        Ok(())
-    }
-
-    /// Process PermanentlyDisableUpgrades instruction
-    fn process_permanently_disable_upgrades(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let current_authority_info = next_account_info(account_info_iter)?;
-        let program_account_info = next_account_info(account_info_iter)?;
-        let program_data_account_info = next_account_info(account_info_iter)?;
-        let system_program_info = next_account_info(account_info_iter)?;
-        let bpf_loader_program_info = next_account_info(account_info_iter)?;
-
-        // Check if current authority signed this transaction
-        if !current_authority_info.is_signer {
-            return Err(VCoinError::Unauthorized.into());
-        }
-
-        // Verify program account is this program
-        if program_account_info.key != program_id {
-            return Err(VCoinError::InvalidProgramAccount.into());
-        }
-
-        // Verify BPF Loader program
-        if *bpf_loader_program_info.key != solana_program::bpf_loader_upgradeable::id() {
-            return Err(VCoinError::InvalidBPFLoaderProgram.into());
-        }
-
-        // Create a burn address (all zeros) for the new upgrade authority
-        let burn_address = Pubkey::new_from_array([0u8; 32]);
-
-        // Create the instruction to set the authority to the burn address
-        // This permanently revokes the upgrade capability since the burn address is not a valid keypair
-        let set_authority_instruction = solana_program::bpf_loader_upgradeable::set_upgrade_authority(
-            program_account_info.key,
-            current_authority_info.key,
-            Some(&burn_address),
-        );
-
-        // Call the BPF Loader program to execute the set_authority instruction
-        // We can't use invoke() directly from within our program to call another program's instruction
-        // Instead, we'll provide detailed instructions for how to call this externally
-
-        msg!("‼️ IMPORTANT: PROGRAM UPGRADES WILL BE PERMANENTLY DISABLED ‼️");
-        msg!("This transaction must be executed using the Solana CLI:");
-        msg!("solana program set-upgrade-authority {} --new-upgrade-authority {} --upgrade-authority {}", 
-             program_account_info.key.to_string(),
-             burn_address.to_string(),
-             current_authority_info.key.to_string());
-        
-        msg!("After executing this command, the program will be permanently locked and can never be upgraded.");
-        msg!("Please verify you have the latest audited version before proceeding.");
-        
-        // Return success, though the actual change must be made through CLI
-        Ok(())
-    }
-} 
+}
