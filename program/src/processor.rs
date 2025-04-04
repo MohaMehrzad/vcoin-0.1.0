@@ -779,7 +779,11 @@ impl Processor {
                     msg!("Successfully got price from Pyth: {} USD", 
                          price as f64 / 10f64.powi(USD_DECIMALS as i32));
                     
-                    total_price = total_price.saturating_add(price as u128);
+                    total_price = total_price.checked_add(price as u128)
+                        .ok_or_else(|| {
+                            msg!("Arithmetic overflow in price aggregation");
+                            VCoinError::CalculationError
+                        })?;
                     price_count += 1;
                     successful_oracles += 1;
                     newest_publish_time = publish_time;
@@ -799,7 +803,11 @@ impl Processor {
                     msg!("Successfully got price from Switchboard: {} USD", 
                          price as f64 / 10f64.powi(USD_DECIMALS as i32));
                     
-                    total_price = total_price.saturating_add(price as u128);
+                    total_price = total_price.checked_add(price as u128)
+                        .ok_or_else(|| {
+                            msg!("Arithmetic overflow in price aggregation");
+                            VCoinError::CalculationError
+                        })?;
                     price_count += 1;
                     successful_oracles += 1;
                     newest_publish_time = publish_time;
@@ -832,7 +840,11 @@ impl Processor {
                             msg!("Successfully got price from backup Pyth oracle: {} USD", 
                                  price as f64 / 10f64.powi(USD_DECIMALS as i32));
                             
-                            total_price = total_price.saturating_add(price as u128);
+                            total_price = total_price.checked_add(price as u128)
+                                .ok_or_else(|| {
+                                    msg!("Arithmetic overflow in price aggregation");
+                                    VCoinError::CalculationError
+                                })?;
                             price_count += 1;
                             successful_oracles += 1;
                             
@@ -857,7 +869,11 @@ impl Processor {
                             msg!("Successfully got price from backup Switchboard oracle: {} USD", 
                                  price as f64 / 10f64.powi(USD_DECIMALS as i32));
                             
-                            total_price = total_price.saturating_add(price as u128);
+                            total_price = total_price.checked_add(price as u128)
+                                .ok_or_else(|| {
+                                    msg!("Arithmetic overflow in price aggregation");
+                                    VCoinError::CalculationError
+                                })?;
                             price_count += 1;
                             successful_oracles += 1;
                             
@@ -911,14 +927,38 @@ impl Processor {
             // Calculate the percentage change in basis points (10000 = 100%)
             let change_bps = if final_price > prev_price {
                 // Price increased
-                final_price.saturating_sub(prev_price)
-                    .saturating_mul(10000)
-                    .saturating_div(prev_price)
+                final_price.checked_sub(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic underflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_mul(10000)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_div(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Division by zero in price change calculation");
+                        VCoinError::CalculationError
+                    })?
             } else {
                 // Price decreased
-                prev_price.saturating_sub(final_price)
-                    .saturating_mul(10000)
-                    .saturating_div(prev_price)
+                prev_price.checked_sub(final_price)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic underflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_mul(10000)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_div(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Division by zero in price change calculation");
+                        VCoinError::CalculationError
+                    })?
             };
             
             // Check if change exceeds limit
@@ -999,7 +1039,13 @@ impl Processor {
                 
                 // Check for freshness (prices must be recent)
                 let publish_time = price_account.timestamp;
-                let time_since_update = current_time.saturating_sub(publish_time);
+                let time_since_update = current_time.checked_sub(publish_time)
+                    .unwrap_or_else(|| {
+                        // If timestamp is in the future (should not happen normally), 
+                        // treat as just published (0 seconds old)
+                        msg!("Warning: Oracle timestamp is in the future");
+                        0
+                    });
                 
                 if time_since_update > oracle_freshness::MAX_STALENESS {
                     msg!("Oracle data critically stale: {} seconds old", time_since_update);
@@ -1014,8 +1060,17 @@ impl Processor {
                 let exponent = price_account.expo;
                 let scale_factor = 10u64.pow((USD_DECIMALS as i32 - exponent) as u32);
                 
-                let price = (pyth_price as u64).saturating_mul(scale_factor);
-                let confidence = (pyth_confidence as u64).saturating_mul(scale_factor);
+                let price = (pyth_price as u64).checked_mul(scale_factor)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in Pyth price conversion");
+                        VCoinError::CalculationError
+                    })?;
+                
+                let confidence = (pyth_confidence as u64).checked_mul(scale_factor)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in Pyth confidence conversion");
+                        VCoinError::CalculationError
+                    })?;
                 
                 Ok((price, confidence, publish_time))
             }
@@ -1067,7 +1122,13 @@ impl Processor {
                 
                 // Check for freshness
                 let publish_time = aggregator.latest_confirmed_round.round_open_timestamp as i64;
-                let time_since_update = current_time.saturating_sub(publish_time);
+                let time_since_update = current_time.checked_sub(publish_time)
+                    .unwrap_or_else(|| {
+                        // If timestamp is in the future (should not happen normally), 
+                        // treat as just published (0 seconds old)
+                        msg!("Warning: Oracle timestamp is in the future");
+                        0
+                    });
                 
                 if time_since_update > oracle_freshness::MAX_STALENESS {
                     msg!("Oracle data critically stale: {} seconds old", time_since_update);
@@ -1177,7 +1238,14 @@ impl Processor {
         }
 
         // Check how long since last price update
-        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        let time_since_update = current_time.checked_sub(controller_state.last_price_update)
+            .unwrap_or_else(|| {
+                // If timestamp is in the future (should not happen normally), 
+                // treat as just updated (0 seconds old)
+                msg!("Warning: Last price update timestamp is in the future");
+                0
+            });
+
         if time_since_update > oracle_freshness::STRICT_FRESHNESS {
             msg!("Price data too stale for burn operation: {} seconds old", time_since_update);
             msg!("Autonomous supply operations require data no older than {} seconds", 
@@ -1409,7 +1477,14 @@ impl Processor {
         }
 
         // Check how long since last price update
-        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        let time_since_update = current_time.checked_sub(controller_state.last_price_update)
+            .unwrap_or_else(|| {
+                // If timestamp is in the future (should not happen normally), 
+                // treat as just updated (0 seconds old)
+                msg!("Warning: Last price update timestamp is in the future");
+                0
+            });
+
         if time_since_update > oracle_freshness::STRICT_FRESHNESS {
             msg!("Price data too stale for mint operation: {} seconds old", time_since_update);
             msg!("Autonomous supply operations require data no older than {} seconds", 
