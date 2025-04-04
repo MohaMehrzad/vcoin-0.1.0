@@ -100,13 +100,13 @@ impl PresaleState {
         // Base size excluding Vec<Pubkey> and Vec<PresaleContribution>
         let base_size = std::mem::size_of::<Self>() - std::mem::size_of::<Vec<Pubkey>>() - std::mem::size_of::<Vec<PresaleContribution>>() - std::mem::size_of::<Vec<Pubkey>>();
         
-        // Start with space for 50,000 buyers as requested
-        let buyers_capacity = 50_000;
+        // Start with space for 15,000 buyers as requested
+        let buyers_capacity = 15_000;
         let buyers_vec_size = std::mem::size_of::<Pubkey>().checked_mul(buyers_capacity)
             .expect("Calculation error in get_size - buyers_vec_size overflow");
         
-        // Space for up to 50,000 contributions
-        let contributions_capacity = 50_000;
+        // Space for up to 15,000 contributions
+        let contributions_capacity = 15_000;
         let contribution_size = std::mem::size_of::<PresaleContribution>();
         let contributions_vec_size = contribution_size.checked_mul(contributions_capacity)
             .expect("Calculation error in get_size - contributions_vec_size overflow");

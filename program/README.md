@@ -73,16 +73,17 @@ The presale system allows for token sales with the following features:
 - Configurable start and end times
 - Hard and soft caps
 - Minimum and maximum purchase limits
-- Expandable capacity (supports up to 1 million unique buyers)
+- Initial capacity for 15,000 buyers
+- Expandable capacity (can grow beyond 15,000 up to 1 million unique buyers)
 
 ### Instructions
 
-- `InitializePresale`: Sets up the presale with configurable parameters
+- `InitializePresale`: Sets up the presale with configurable parameters and space for 15,000 buyers
 - `AddSupportedStablecoin`: Adds a supported stablecoin for purchases
 - `BuyTokensWithStablecoin`: Purchases tokens with approved stablecoins
 - `EndPresale`: Manually ends the presale
 - `LaunchToken`: Marks the token as launched, beginning the refund availability countdown
-- `ExpandPresaleAccount`: Increases the capacity for more buyers (up to 1M)
+- `ExpandPresaleAccount`: Increases the capacity for more buyers (beyond 15,000 up to 1M)
 
 ## Refund Mechanism
 
@@ -181,7 +182,7 @@ VCoin integrates with multiple price oracles with enhanced reliability:
 VCoin implements several security features:
 
 - **Reentrancy Guards**: Prevents reentrancy attacks on sensitive operations
-- **Checked Math**: Uses checked arithmetic to prevent overflow/underflow
+- **Checked Math**: Uses checked arithmetic operations (never saturating) to prevent overflow/underflow with explicit error handling
 - **PDA Authorization**: Uses program derived addresses for secure authorization
 - **Timelock Mechanisms**: Prevents rushed changes and actions
 - **Oracle Validation**: Thorough validation of oracle data with multi-source verification

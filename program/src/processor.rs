@@ -529,6 +529,153 @@ impl Processor {
         Ok(())
     }
 
+    /// Process InitializePresale instruction
+    /// This creates a new presale with the specified parameters
+    fn process_initialize_presale(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        params: InitializePresaleParams,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let authority_info = next_account_info(account_info_iter)?;
+        let presale_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let dev_treasury_info = next_account_info(account_info_iter)?;
+        let locked_treasury_info = next_account_info(account_info_iter)?;
+        let system_program_info = next_account_info(account_info_iter)?;
+        let rent_info = next_account_info(account_info_iter)?;
+
+        // Verify the authority signed the transaction
+        if !authority_info.is_signer {
+            msg!("Authority must sign transaction");
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Verify presale account is a signer (for initialization)
+        if !presale_info.is_signer {
+            msg!("Presale account must be a signer for initialization");
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Verify system program
+        if system_program_info.key != &solana_program::system_program::ID {
+            msg!("Invalid system program");
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        // Validate presale parameters
+        if params.end_time <= params.start_time {
+            msg!("Presale end time must be after start time");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.soft_cap == 0 || params.hard_cap == 0 {
+            msg!("Presale caps cannot be zero");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.soft_cap > params.hard_cap {
+            msg!("Soft cap cannot exceed hard cap");
+            return Err(VCoinError::SoftCapTooLow.into());
+        }
+
+        // Soft cap should be at least 20% of hard cap for reasonable economics
+        if params.soft_cap.checked_mul(5).unwrap_or(u64::MAX) < params.hard_cap {
+            msg!("Soft cap too low, must be at least 20% of hard cap");
+            return Err(VCoinError::SoftCapTooLow.into());
+        }
+
+        if params.min_purchase == 0 || params.max_purchase == 0 {
+            msg!("Purchase limits cannot be zero");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.min_purchase > params.max_purchase {
+            msg!("Minimum purchase cannot exceed maximum purchase");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.token_price == 0 {
+            msg!("Token price cannot be zero");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        // Calculate account size for an initial capacity of 15,000 buyers
+        let rent = Rent::from_account_info(rent_info)?;
+        let initial_capacity = 15_000; // Initial capacity for 15,000 buyers
+        let account_size = PresaleState::get_size_for_buyers(initial_capacity);
+        let account_lamports = rent.minimum_balance(account_size);
+
+        // Create presale account
+        invoke(
+            &solana_program::system_instruction::create_account(
+                authority_info.key,
+                presale_info.key,
+                account_lamports,
+                account_size as u64,
+                program_id,
+            ),
+            &[
+                authority_info.clone(),
+                presale_info.clone(),
+                system_program_info.clone(),
+            ],
+        )?;
+
+        // Initialize presale state
+        let mut presale_state = PresaleState {
+            is_initialized: true,
+            authority: *authority_info.key,
+            mint: *mint_info.key,
+            dev_treasury: *dev_treasury_info.key,
+            locked_treasury: *locked_treasury_info.key,
+            start_time: params.start_time,
+            end_time: params.end_time,
+            token_price: params.token_price,
+            hard_cap: params.hard_cap,
+            soft_cap: params.soft_cap,
+            min_purchase: params.min_purchase,
+            max_purchase: params.max_purchase,
+            total_tokens_sold: 0,
+            total_usd_raised: 0,
+            num_buyers: 0,
+            is_active: false,
+            has_ended: false,
+            token_launched: false,
+            launch_timestamp: 0,
+            refund_available_timestamp: 0,
+            refund_period_end_timestamp: 0,
+            soft_cap_reached: false,
+            allowed_stablecoins: Vec::new(),
+            contributions: Vec::new(),
+            buyer_pubkeys: Vec::new(),
+            dev_funds_refundable: false,
+            dev_refund_available_timestamp: 0,
+            dev_refund_period_end_timestamp: 0,
+        };
+
+        // Add default stablecoins (USDC and USDT)
+        // Mainnet USDC
+        presale_state.allowed_stablecoins.push(
+            Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap_or_default()
+        );
+        // Mainnet USDT
+        presale_state.allowed_stablecoins.push(
+            Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap_or_default()
+        );
+
+        // Save presale state
+        presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
+
+        msg!("Presale initialized successfully with capacity for 15,000 buyers");
+        msg!("Start time: {}, End time: {}", params.start_time, params.end_time);
+        msg!("Token price: {} micro-USD", params.token_price);
+        msg!("Hard cap: {} micro-USD, Soft cap: {} micro-USD", params.hard_cap, params.soft_cap);
+        msg!("Purchase limits: min {} micro-USD, max {} micro-USD", params.min_purchase, params.max_purchase);
+        
+        Ok(())
+    }
+
     /// Process ExpandPresaleAccount instruction
     /// Allows expanding the presale account to accommodate more buyers
     fn process_expand_presale_account(
@@ -594,7 +741,8 @@ impl Processor {
             let current_minimum_balance = rent.minimum_balance(current_size);
             let new_minimum_balance = rent.minimum_balance(new_size);
             
-            let lamports_needed = new_minimum_balance.saturating_sub(current_minimum_balance);
+            let lamports_needed = new_minimum_balance.checked_sub(current_minimum_balance)
+                .ok_or(VCoinError::CalculationError)?;
             
             if lamports_needed > 0 {
                 msg!("Transferring {} lamports to fund account expansion", lamports_needed);
@@ -778,7 +926,11 @@ impl Processor {
                     msg!("Successfully got price from Pyth: {} USD", 
                          price as f64 / 10f64.powi(USD_DECIMALS as i32));
                     
-                    total_price = total_price.saturating_add(price as u128);
+                    total_price = total_price.checked_add(price as u128)
+                        .ok_or_else(|| {
+                            msg!("Arithmetic overflow in price aggregation");
+                            VCoinError::CalculationError
+                        })?;
                     price_count += 1;
                     successful_oracles += 1;
                     newest_publish_time = publish_time;
@@ -798,7 +950,11 @@ impl Processor {
                     msg!("Successfully got price from Switchboard: {} USD", 
                          price as f64 / 10f64.powi(USD_DECIMALS as i32));
                     
-                    total_price = total_price.saturating_add(price as u128);
+                    total_price = total_price.checked_add(price as u128)
+                        .ok_or_else(|| {
+                            msg!("Arithmetic overflow in price aggregation");
+                            VCoinError::CalculationError
+                        })?;
                     price_count += 1;
                     successful_oracles += 1;
                     newest_publish_time = publish_time;
@@ -831,7 +987,11 @@ impl Processor {
                             msg!("Successfully got price from backup Pyth oracle: {} USD", 
                                  price as f64 / 10f64.powi(USD_DECIMALS as i32));
                             
-                            total_price = total_price.saturating_add(price as u128);
+                            total_price = total_price.checked_add(price as u128)
+                                .ok_or_else(|| {
+                                    msg!("Arithmetic overflow in price aggregation");
+                                    VCoinError::CalculationError
+                                })?;
                             price_count += 1;
                             successful_oracles += 1;
                             
@@ -856,7 +1016,11 @@ impl Processor {
                             msg!("Successfully got price from backup Switchboard oracle: {} USD", 
                                  price as f64 / 10f64.powi(USD_DECIMALS as i32));
                             
-                            total_price = total_price.saturating_add(price as u128);
+                            total_price = total_price.checked_add(price as u128)
+                                .ok_or_else(|| {
+                                    msg!("Arithmetic overflow in price aggregation");
+                                    VCoinError::CalculationError
+                                })?;
                             price_count += 1;
                             successful_oracles += 1;
                             
@@ -910,14 +1074,38 @@ impl Processor {
             // Calculate the percentage change in basis points (10000 = 100%)
             let change_bps = if final_price > prev_price {
                 // Price increased
-                final_price.saturating_sub(prev_price)
-                    .saturating_mul(10000)
-                    .saturating_div(prev_price)
+                final_price.checked_sub(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic underflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_mul(10000)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_div(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Division by zero in price change calculation");
+                        VCoinError::CalculationError
+                    })?
             } else {
                 // Price decreased
-                prev_price.saturating_sub(final_price)
-                    .saturating_mul(10000)
-                    .saturating_div(prev_price)
+                prev_price.checked_sub(final_price)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic underflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_mul(10000)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in price change calculation");
+                        VCoinError::CalculationError
+                    })?
+                    .checked_div(prev_price)
+                    .ok_or_else(|| {
+                        msg!("Division by zero in price change calculation");
+                        VCoinError::CalculationError
+                    })?
             };
             
             // Check if change exceeds limit
@@ -998,7 +1186,13 @@ impl Processor {
                 
                 // Check for freshness (prices must be recent)
                 let publish_time = price_account.timestamp;
-                let time_since_update = current_time.saturating_sub(publish_time);
+                let time_since_update = current_time.checked_sub(publish_time)
+                    .unwrap_or_else(|| {
+                        // If timestamp is in the future (should not happen normally), 
+                        // treat as just updated (0 seconds old)
+                        msg!("Warning: Last price update timestamp is in the future");
+                        0
+                    });
                 
                 if time_since_update > oracle_freshness::MAX_STALENESS {
                     msg!("Oracle data critically stale: {} seconds old", time_since_update);
@@ -1013,8 +1207,17 @@ impl Processor {
                 let exponent = price_account.expo;
                 let scale_factor = 10u64.pow((USD_DECIMALS as i32 - exponent) as u32);
                 
-                let price = (pyth_price as u64).saturating_mul(scale_factor);
-                let confidence = (pyth_confidence as u64).saturating_mul(scale_factor);
+                let price = (pyth_price as u64).checked_mul(scale_factor)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in Pyth price conversion");
+                        VCoinError::CalculationError
+                    })?;
+                
+                let confidence = (pyth_confidence as u64).checked_mul(scale_factor)
+                    .ok_or_else(|| {
+                        msg!("Arithmetic overflow in Pyth confidence conversion");
+                        VCoinError::CalculationError
+                    })?;
                 
                 Ok((price, confidence, publish_time))
             }
@@ -1066,7 +1269,13 @@ impl Processor {
                 
                 // Check for freshness
                 let publish_time = aggregator.latest_confirmed_round.round_open_timestamp as i64;
-                let time_since_update = current_time.saturating_sub(publish_time);
+                let time_since_update = current_time.checked_sub(publish_time)
+                    .unwrap_or_else(|| {
+                        // If timestamp is in the future (should not happen normally), 
+                        // treat as just updated (0 seconds old)
+                        msg!("Warning: Last price update timestamp is in the future");
+                        0
+                    });
                 
                 if time_since_update > oracle_freshness::MAX_STALENESS {
                     msg!("Oracle data critically stale: {} seconds old", time_since_update);
@@ -1176,7 +1385,14 @@ impl Processor {
         }
 
         // Check how long since last price update
-        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        let time_since_update = current_time.checked_sub(controller_state.last_price_update)
+            .unwrap_or_else(|| {
+                // If timestamp is in the future (should not happen normally), 
+                // treat as just updated (0 seconds old)
+                msg!("Warning: Last price update timestamp is in the future");
+                0
+            });
+
         if time_since_update > oracle_freshness::STRICT_FRESHNESS {
             msg!("Price data too stale for burn operation: {} seconds old", time_since_update);
             msg!("Autonomous supply operations require data no older than {} seconds", 
@@ -1408,7 +1624,14 @@ impl Processor {
         }
 
         // Check how long since last price update
-        let time_since_update = current_time.saturating_sub(controller_state.last_price_update);
+        let time_since_update = current_time.checked_sub(controller_state.last_price_update)
+            .unwrap_or_else(|| {
+                // If timestamp is in the future (should not happen normally), 
+                // treat as just updated (0 seconds old)
+                msg!("Warning: Last price update timestamp is in the future");
+                0
+            });
+
         if time_since_update > oracle_freshness::STRICT_FRESHNESS {
             msg!("Price data too stale for mint operation: {} seconds old", time_since_update);
             msg!("Autonomous supply operations require data no older than {} seconds", 
