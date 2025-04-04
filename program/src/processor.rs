@@ -577,8 +577,8 @@ impl Processor {
             .ok_or(VCoinError::CalculationError)?;
         
         // Safety check for extremely large buyer numbers
-        if total_buyers > 1_000_000 {
-            msg!("Expansion would exceed maximum supported buyers (1,000,000)");
+        if total_buyers > 5_000_000 {
+            msg!("Expansion would exceed maximum supported buyers (5,000,000)");
             return Err(VCoinError::InvalidPresaleParameters.into());
         }
         
@@ -594,7 +594,8 @@ impl Processor {
             let current_minimum_balance = rent.minimum_balance(current_size);
             let new_minimum_balance = rent.minimum_balance(new_size);
             
-            let lamports_needed = new_minimum_balance.saturating_sub(current_minimum_balance);
+            let lamports_needed = new_minimum_balance.checked_sub(current_minimum_balance)
+                .ok_or(VCoinError::CalculationError)?;
             
             if lamports_needed > 0 {
                 msg!("Transferring {} lamports to fund account expansion", lamports_needed);
