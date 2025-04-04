@@ -480,52 +480,145 @@ impl Processor {
         }
     }
 
-    /// Process SetTransferFee instruction with a hard 5% limit
-    pub fn process_set_transfer_fee(
+    /// Process InitializePresale instruction
+    /// This creates a new presale with the specified parameters
+    fn process_initialize_presale(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
-        transfer_fee_basis_points: u16,
-        maximum_fee: u64,
+        params: InitializePresaleParams,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
-        let fee_authority_info = next_account_info(account_info_iter)?;
+        let authority_info = next_account_info(account_info_iter)?;
+        let presale_info = next_account_info(account_info_iter)?;
         let mint_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-        
-        // Verify token program is Token-2022
-        if *token_program_info.key != TOKEN_2022_PROGRAM_ID {
-            return Err(VCoinError::InvalidAccountOwner.into());
-        }
-        
-        // Verify fee authority is a signer
-        if !fee_authority_info.is_signer {
+        let dev_treasury_info = next_account_info(account_info_iter)?;
+        let locked_treasury_info = next_account_info(account_info_iter)?;
+        let system_program_info = next_account_info(account_info_iter)?;
+        let rent_info = next_account_info(account_info_iter)?;
+
+        // Verify authority signed the transaction
+        if !authority_info.is_signer {
+            msg!("Authority must sign transaction");
             return Err(VCoinError::Unauthorized.into());
         }
-        
-        // Validate the transfer fee basis points (max 1% = 100 basis points)
-        if transfer_fee_basis_points > 100 {
-            msg!("Transfer fee cannot exceed 1% (100 basis points), attempted: {}", transfer_fee_basis_points);
-            return Err(VCoinError::InvalidFeeAmount.into());
+
+        // Verify system program
+        if system_program_info.key != &solana_program::system_program::ID {
+            msg!("Invalid system program");
+            return Err(ProgramError::IncorrectProgramId);
         }
 
-        // Call the SPL Token-2022 program to set the transfer fee
+        // Verify presale account is signer (for initialization)
+        if !presale_info.is_signer {
+            msg!("Presale account must be a signer for initialization");
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Check presale account is not already initialized
+        if presale_info.data_len() > 0 {
+            msg!("Presale account already exists");
+            return Err(VCoinError::AlreadyInitialized.into());
+        }
+
+        // Verify presale parameters
+        if params.start_time >= params.end_time {
+            msg!("Start time must be before end time");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.token_price == 0 {
+            msg!("Token price cannot be zero");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.hard_cap <= params.soft_cap {
+            msg!("Hard cap must be greater than soft cap");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        // Soft cap should be at least 20% of hard cap
+        let min_soft_cap = params.hard_cap.checked_mul(20).ok_or(VCoinError::CalculationError)?
+            .checked_div(100).ok_or(VCoinError::CalculationError)?;
+        if params.soft_cap < min_soft_cap {
+            msg!("Soft cap must be at least 20% of hard cap");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        if params.min_purchase == 0 || params.max_purchase == 0 || params.min_purchase > params.max_purchase {
+            msg!("Invalid purchase limits");
+            return Err(VCoinError::InvalidPresaleParameters.into());
+        }
+
+        // Calculate account size for an initial capacity of 15,000 buyers
+        let rent = Rent::from_account_info(rent_info)?;
+        let initial_capacity = 15_000; // Initial capacity for 15,000 buyers
+        let account_size = PresaleState::get_size_for_buyers(initial_capacity);
+        let account_lamports = rent.minimum_balance(account_size);
+        
+        // Create presale account
         invoke(
-            &set_transfer_fee(
-                token_program_info.key,
-                mint_info.key,
-                fee_authority_info.key,
-                transfer_fee_basis_points,
-                maximum_fee,
-            )?,
+            &system_instruction::create_account(
+                authority_info.key,
+                presale_info.key,
+                account_lamports,
+                account_size as u64,
+                program_id,
+            ),
             &[
-                mint_info.clone(),
-                fee_authority_info.clone(),
-                token_program_info.clone(),
+                authority_info.clone(),
+                presale_info.clone(),
+                system_program_info.clone(),
             ],
         )?;
 
-        msg!("Transfer fee set to {} basis points, maximum fee {} units", 
-             transfer_fee_basis_points, maximum_fee);
+        // Initialize empty presale state
+        let mut presale_state = PresaleState {
+            is_initialized: true,
+            authority: *authority_info.key,
+            mint: *mint_info.key,
+            dev_treasury: *dev_treasury_info.key,
+            locked_treasury: *locked_treasury_info.key,
+            start_time: params.start_time,
+            end_time: params.end_time,
+            token_price: params.token_price,
+            hard_cap: params.hard_cap,
+            soft_cap: params.soft_cap,
+            min_purchase: params.min_purchase,
+            max_purchase: params.max_purchase,
+            total_tokens_sold: 0,
+            total_usd_raised: 0,
+            num_buyers: 0,
+            is_active: true,
+            has_ended: false,
+            token_launched: false,
+            launch_timestamp: 0,
+            refund_available_timestamp: 0,
+            refund_period_end_timestamp: 0,
+            soft_cap_reached: false,
+            allowed_stablecoins: Vec::new(),
+            contributions: Vec::new(),
+            buyer_pubkeys: Vec::new(),
+            dev_funds_refundable: false,
+            dev_refund_available_timestamp: 0,
+            dev_refund_period_end_timestamp: 0,
+        };
+
+        // Add default stablecoins (USDC and USDT on mainnet)
+        let usdc_mainnet = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        presale_state.add_allowed_stablecoin(usdc_mainnet)?;
+        
+        let usdt_mainnet = Pubkey::from_str("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB").unwrap();
+        presale_state.add_allowed_stablecoin(usdt_mainnet)?;
+
+        // Save presale state
+        presale_state.serialize(&mut *presale_info.data.borrow_mut())?;
+
+        msg!("Presale initialized successfully with capacity for 15,000 buyers");
+        msg!("Start time: {}, End time: {}", params.start_time, params.end_time);
+        msg!("Token price: {} micro-USD", params.token_price);
+        msg!("Hard cap: {} micro-USD, Soft cap: {} micro-USD", params.hard_cap, params.soft_cap);
+        msg!("Purchase limits: min {} micro-USD, max {} micro-USD", params.min_purchase, params.max_purchase);
+        
         Ok(())
     }
 
@@ -1706,6 +1799,54 @@ impl Processor {
         msg!("Initial price: {}, Current supply: {}", initial_price, mint_data.supply);
         msg!("Minimum supply (1B tokens): {}", min_supply);
         msg!("High supply threshold (5B tokens): {}", high_supply_threshold);
+        Ok(())
+    }
+
+    fn process_set_transfer_fee(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        transfer_fee_basis_points: u16,
+        maximum_fee: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let fee_authority_info = next_account_info(account_info_iter)?;
+        let mint_info = next_account_info(account_info_iter)?;
+        let token_program_info = next_account_info(account_info_iter)?;
+        
+        // Verify token program is Token-2022
+        if *token_program_info.key != TOKEN_2022_PROGRAM_ID {
+            return Err(VCoinError::InvalidAccountOwner.into());
+        }
+
+        // Verify fee authority is a signer
+        if !fee_authority_info.is_signer {
+            return Err(VCoinError::Unauthorized.into());
+        }
+
+        // Validate the transfer fee basis points (max 1% = 100 basis points)
+        if transfer_fee_basis_points > 100 {
+            msg!("Transfer fee cannot exceed 1% (100 basis points), attempted: {}", transfer_fee_basis_points);
+            return Err(VCoinError::InvalidFeeAmount.into());
+        }
+
+        // Call the SPL Token-2022 program to set the transfer fee
+        invoke(
+            &set_transfer_fee(
+                token_program_info.key,
+                mint_info.key,
+                fee_authority_info.key,
+                transfer_fee_basis_points,
+                maximum_fee,
+            )?,
+            &[
+                mint_info.clone(),
+                fee_authority_info.clone(),
+                token_program_info.clone(),
+            ],
+        )?;
+
+        msg!("Transfer fee set to {} basis points, maximum fee {} units", 
+             transfer_fee_basis_points, maximum_fee);
         Ok(())
     }
 }
