@@ -126,14 +126,3 @@ Added helper functions:
 - Lines ~490-550: Instruction handler dispatch in main process function
 - Lines ~3000-3200: All governance instruction processing functions
 
-## Testing Considerations
-
-The governance system should be tested for:
-
-1. Proper council member management
-2. Correct proposal creation and voting
-3. Accurate vote counting and status updates
-4. Proper timelock enforcement
-5. Successful proposal execution
-6. Edge cases (tie votes, unanimous decisions, etc.)
-7. Security against unauthorized operations
