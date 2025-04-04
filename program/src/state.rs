@@ -1,6 +1,10 @@
 use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::pubkey::Pubkey;
-use solana_program::program_error::ProgramError;
+use solana_program::{
+    program_error::ProgramError,
+    pubkey::Pubkey,
+};
+
+use crate::error::VCoinError;
 
 /// Maximum number of vesting beneficiaries
 pub const MAX_VESTING_BENEFICIARIES: usize = 100;
@@ -567,5 +571,420 @@ impl UpgradeTimelock {
     /// Get the size of the upgrade timelock account
     pub fn get_size() -> usize {
         std::mem::size_of::<Self>()
+    }
+}
+
+/// The maximum number of council members allowed
+pub const MAX_COUNCIL_MEMBERS: usize = 9;
+
+/// The maximum number of proposals that can be stored
+pub const MAX_PROPOSALS: usize = 20;
+
+/// Proposal types
+#[derive(Clone, Copy, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum ProposalType {
+    /// Upgrade the program
+    UpgradeProgram,
+    /// Add a new council member
+    AddCouncilMember,
+    /// Remove a council member
+    RemoveCouncilMember,
+    /// Change quorum requirements
+    ChangeQuorum,
+    /// Change transfer fee
+    ChangeTransferFee,
+    /// Change supply parameters
+    ChangeSupplyParameters,
+    /// Mint tokens to address
+    MintTokens,
+    /// Burn tokens from treasury
+    BurnTokens,
+    /// Other proposal type with description
+    Other,
+}
+
+/// Status of a proposal
+#[derive(Clone, Copy, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum ProposalStatus {
+    /// Proposal is active and can be voted on
+    Active,
+    /// Proposal has been approved
+    Approved,
+    /// Proposal has been rejected
+    Rejected,
+    /// Proposal has been executed
+    Executed,
+    /// Proposal has been cancelled
+    Cancelled,
+}
+
+/// A vote on a proposal
+#[derive(Clone, Copy, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum Vote {
+    /// Vote in favor of the proposal
+    For,
+    /// Vote against the proposal
+    Against,
+    /// Abstain from voting
+    Abstain,
+}
+
+/// A proposal in the governance system
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct Proposal {
+    /// Unique identifier for the proposal
+    pub id: u32,
+    /// The type of proposal
+    pub proposal_type: ProposalType,
+    /// The creator of the proposal
+    pub proposer: Pubkey,
+    /// Title of the proposal (short description)
+    pub title: String,
+    /// Description of the proposal
+    pub description: String,
+    /// Link to additional documentation
+    pub link: String,
+    /// The program or account this proposal affects
+    pub target: Pubkey,
+    /// Parameters for the proposal (serialized)
+    pub parameters: Vec<u8>,
+    /// When the proposal was created
+    pub created_at: i64,
+    /// When voting ends
+    pub voting_ends_at: i64,
+    /// When the proposal can be executed (if approved)
+    pub executable_at: i64,
+    /// Status of the proposal
+    pub status: ProposalStatus,
+    /// Number of votes in favor
+    pub votes_for: u32,
+    /// Number of votes against
+    pub votes_against: u32,
+    /// Number of abstentions
+    pub abstain_count: u32,
+    /// Has the proposal been executed
+    pub executed: bool,
+}
+
+/// Records a member's vote on a proposal
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct VoteRecord {
+    /// The proposal this vote is for
+    pub proposal_id: u32,
+    /// The council member who voted
+    pub voter: Pubkey,
+    /// The vote cast
+    pub vote: Vote,
+    /// When the vote was cast
+    pub timestamp: i64,
+}
+
+/// Governance configuration
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct GovernanceConfig {
+    /// Minimum approval quorum (percentage 0-100)
+    pub min_approval_percent: u8,
+    /// Voting duration in seconds
+    pub voting_duration: i64,
+    /// Timelock duration after approval before execution
+    pub timelock_duration: i64,
+}
+
+/// Council governance state
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct CouncilState {
+    /// Whether governance has been initialized
+    pub is_initialized: bool,
+    /// The mint this governance system controls
+    pub mint: Pubkey,
+    /// Council members
+    pub council_members: Vec<Pubkey>,
+    /// Active proposals
+    pub proposals: Vec<Proposal>,
+    /// Vote records for each council member on each proposal
+    pub vote_records: Vec<VoteRecord>,
+    /// Governance configuration
+    pub config: GovernanceConfig,
+    /// Next proposal ID
+    pub next_proposal_id: u32,
+}
+
+impl CouncilState {
+    /// Get the size of the council state account
+    pub fn get_size() -> usize {
+        // Base size for fixed fields
+        let mut size = 1 + 32; // is_initialized + mint
+        
+        // Council members (max sized vector)
+        size += 4 + (MAX_COUNCIL_MEMBERS * 32); // len + pubkeys
+        
+        // Proposals (max sized vector with variable-sized elements)
+        // More conservative estimate for each proposal
+        let proposal_size = 4 + // id
+                           1 + // proposal_type
+                           32 + // proposer
+                           100 + // title (variable)
+                           1000 + // description (variable)
+                           200 + // link (variable)
+                           32 + // target
+                           200 + // parameters (variable)
+                           8 + // created_at
+                           8 + // voting_ends_at
+                           8 + // executable_at
+                           1 + // status
+                           4 + // votes_for
+                           4 + // votes_against
+                           4 + // abstain_count
+                           1; // executed
+        size += 4 + (MAX_PROPOSALS * proposal_size);
+        
+        // Vote records (max sized vector with fixed-size elements)
+        let vote_record_size = 4 + 32 + 1 + 8; // proposal_id + voter + vote + timestamp
+        let max_vote_records = MAX_COUNCIL_MEMBERS * MAX_PROPOSALS; // One vote per council member per proposal
+        size += 4 + (max_vote_records * vote_record_size);
+        
+        // Governance config
+        size += 1 + 8 + 8; // min_approval_percent + voting_duration + timelock_duration
+        
+        // Next proposal ID
+        size += 4;
+
+        // Add buffer for safety (10%)
+        size += size / 10;
+        
+        size
+    }
+    
+    /// Check if an address is a council member
+    pub fn is_council_member(&self, address: &Pubkey) -> bool {
+        self.council_members.contains(address)
+    }
+    
+    /// Add a new proposal
+    pub fn add_proposal(
+        &mut self,
+        proposal_type: ProposalType,
+        proposer: Pubkey,
+        title: String,
+        description: String,
+        link: String,
+        target: Pubkey,
+        parameters: Vec<u8>,
+        created_at: i64,
+    ) -> Result<u32, ProgramError> {
+        // Check if we've reached the max proposals limit
+        if self.proposals.len() >= MAX_PROPOSALS {
+            return Err(VCoinError::BeneficiaryLimitReached.into());
+        }
+        
+        // Validate string lengths to prevent excessive storage usage
+        if title.len() > 80 {
+            msg!("Title too long, must be 80 characters or less");
+            return Err(VCoinError::InvalidParameter.into());
+        }
+        
+        if description.len() > 750 {
+            msg!("Description too long, must be 750 characters or less");
+            return Err(VCoinError::InvalidParameter.into());
+        }
+        
+        if link.len() > 150 {
+            msg!("Link too long, must be 150 characters or less");
+            return Err(VCoinError::InvalidParameter.into());
+        }
+        
+        if parameters.len() > 150 {
+            msg!("Parameters too large, must be 150 bytes or less");
+            return Err(VCoinError::InvalidParameter.into());
+        }
+        
+        // Get the next proposal ID
+        let id = self.next_proposal_id;
+        self.next_proposal_id = self.next_proposal_id.checked_add(1)
+            .ok_or(VCoinError::CalculationError)?;
+        
+        // Calculate voting end time
+        let voting_ends_at = created_at.checked_add(self.config.voting_duration)
+            .ok_or(VCoinError::CalculationError)?;
+            
+        // Calculate when the proposal can be executed if approved
+        let executable_at = voting_ends_at.checked_add(self.config.timelock_duration)
+            .ok_or(VCoinError::CalculationError)?;
+        
+        // Create the new proposal
+        let proposal = Proposal {
+            id,
+            proposal_type,
+            proposer,
+            title,
+            description,
+            link,
+            target,
+            parameters,
+            created_at,
+            voting_ends_at,
+            executable_at,
+            status: ProposalStatus::Active,
+            votes_for: 0,
+            votes_against: 0,
+            abstain_count: 0,
+            executed: false,
+        };
+        
+        // Add the proposal to the list
+        self.proposals.push(proposal);
+        
+        Ok(id)
+    }
+    
+    /// Cast a vote on a proposal
+    pub fn cast_vote(
+        &mut self,
+        proposal_id: u32,
+        voter: Pubkey,
+        vote: Vote,
+        timestamp: i64,
+    ) -> Result<(), ProgramError> {
+        // Check if the voter is a council member
+        if !self.is_council_member(&voter) {
+            return Err(VCoinError::Unauthorized.into());
+        }
+        
+        // Find the proposal
+        let proposal_index = self.proposals.iter().position(|p| p.id == proposal_id)
+            .ok_or(VCoinError::InvalidProposalStatus)?;
+            
+        let proposal = &mut self.proposals[proposal_index];
+        
+        // Check if the proposal is active
+        if proposal.status != ProposalStatus::Active {
+            return Err(VCoinError::InvalidProposalStatus.into());
+        }
+        
+        // Check if voting has ended
+        if timestamp > proposal.voting_ends_at {
+            return Err(VCoinError::ExpiredDeadline.into());
+        }
+        
+        // Check if the member has already voted
+        for record in &self.vote_records {
+            if record.proposal_id == proposal_id && record.voter == voter {
+                return Err(VCoinError::AlreadyVoted.into());
+            }
+        }
+        
+        // Record the vote
+        let vote_record = VoteRecord {
+            proposal_id,
+            voter,
+            vote,
+            timestamp,
+        };
+        
+        self.vote_records.push(vote_record);
+        
+        // Update the vote count on the proposal
+        match vote {
+            Vote::For => proposal.votes_for = proposal.votes_for.checked_add(1)
+                .ok_or(VCoinError::CalculationError)?,
+            Vote::Against => proposal.votes_against = proposal.votes_against.checked_add(1)
+                .ok_or(VCoinError::CalculationError)?,
+            Vote::Abstain => proposal.abstain_count = proposal.abstain_count.checked_add(1)
+                .ok_or(VCoinError::CalculationError)?,
+        }
+        
+        Ok(())
+    }
+    
+    /// Find a proposal by ID
+    pub fn find_proposal(&self, proposal_id: u32) -> Option<&Proposal> {
+        self.proposals.iter().find(|p| p.id == proposal_id)
+    }
+    
+    /// Find a proposal by ID (mutable)
+    pub fn find_proposal_mut(&mut self, proposal_id: u32) -> Option<&mut Proposal> {
+        self.proposals.iter_mut().find(|p| p.id == proposal_id)
+    }
+    
+    /// Check if a proposal has reached quorum and update its status
+    pub fn check_proposal_status(
+        &mut self,
+        proposal_id: u32,
+        current_time: i64,
+    ) -> Result<ProposalStatus, ProgramError> {
+        // Find the proposal
+        let proposal_index = self.proposals.iter().position(|p| p.id == proposal_id)
+            .ok_or(VCoinError::InvalidProposalStatus)?;
+            
+        let proposal = &mut self.proposals[proposal_index];
+        
+        // If the proposal is not active, return its current status
+        if proposal.status != ProposalStatus::Active {
+            return Ok(proposal.status);
+        }
+        
+        // Check if voting period has ended
+        if current_time <= proposal.voting_ends_at {
+            // Voting is still active
+            return Ok(ProposalStatus::Active);
+        }
+        
+        // Voting has ended, determine the outcome
+        let total_votes = proposal.votes_for + proposal.votes_against + proposal.abstain_count;
+        let total_council_members = self.council_members.len() as u32;
+        
+        // Calculate participation percentage
+        let participation_percent = if total_council_members > 0 {
+            (total_votes * 100) / total_council_members
+        } else {
+            0
+        };
+        
+        // Calculate approval percentage among those who voted (excluding abstentions)
+        let votes_cast = proposal.votes_for + proposal.votes_against;
+        let approval_percent = if votes_cast > 0 {
+            (proposal.votes_for * 100) / votes_cast
+        } else {
+            0
+        };
+        
+        // Check if quorum was reached and proposal was approved
+        if participation_percent >= 50 && approval_percent >= self.config.min_approval_percent as u32 {
+            proposal.status = ProposalStatus::Approved;
+        } else {
+            proposal.status = ProposalStatus::Rejected;
+        }
+        
+        Ok(proposal.status)
+    }
+    
+    /// Add a council member
+    pub fn add_council_member(&mut self, member: Pubkey) -> Result<(), ProgramError> {
+        // Check if we've reached the max council members limit
+        if self.council_members.len() >= MAX_COUNCIL_MEMBERS {
+            return Err(VCoinError::BeneficiaryLimitReached.into());
+        }
+        
+        // Check if the member is already on the council
+        if self.is_council_member(&member) {
+            return Err(VCoinError::BeneficiaryAlreadyExists.into());
+        }
+        
+        // Add the member to the council
+        self.council_members.push(member);
+        
+        Ok(())
+    }
+    
+    /// Remove a council member
+    pub fn remove_council_member(&mut self, member: &Pubkey) -> Result<(), ProgramError> {
+        // Find the member in the council
+        let position = self.council_members.iter().position(|m| m == member)
+            .ok_or(VCoinError::BeneficiaryNotFound)?;
+            
+        // Remove the member
+        self.council_members.remove(position);
+        
+        Ok(())
     }
 } 
