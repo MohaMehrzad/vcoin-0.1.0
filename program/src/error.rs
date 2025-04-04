@@ -216,46 +216,6 @@ pub enum VCoinError {
     /// Token already launched
     #[error("Token has already been launched")]
     TokenAlreadyLaunched,
-
-    /// Program is permanently immutable
-    #[error("Program is permanently immutable")]
-    PermanentlyImmutable,
-
-    /// Upgrade already pending
-    #[error("Upgrade already pending")]
-    UpgradeAlreadyPending,
-
-    /// No upgrade pending
-    #[error("No upgrade pending")]
-    NoUpgradePending,
-
-    /// Timelock not expired
-    #[error("Timelock period not yet expired")]
-    TimelockNotExpired,
-
-    /// Invalid parameter
-    #[error("Invalid parameter")]
-    InvalidParameter,
-
-    /// Expired deadline
-    #[error("Expired deadline")]
-    ExpiredDeadline,
-
-    /// Already voted
-    #[error("Already voted")]
-    AlreadyVoted,
-
-    /// Invalid proposal status
-    #[error("Invalid proposal status")]
-    InvalidProposalStatus,
-
-    /// Voting still active
-    #[error("Voting period still active")]
-    VotingStillActive,
-
-    /// Error executing an instruction
-    #[error("Error executing an instruction")]
-    InstructionExecutionError,
 }
 
 impl From<VCoinError> for ProgramError {
