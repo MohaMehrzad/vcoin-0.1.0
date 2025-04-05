@@ -198,6 +198,30 @@ fn process_set_transfer_fee(
 
 Transfer fees are specified in basis points (1/100th of a percent) with a maximum absolute fee. This enables projects to capture value from secondary market transactions.
 
+#### Detailed Transfer Fee Mechanics
+
+- **Default Fee Rate**: 100 basis points (1% of transaction value)
+- **Maximum Allowable Fee**: 1000 basis points (10%)
+- **Fee Cap**: 1,000,000,000 tokens (1 billion tokens)
+- **Fee Calculation**: For a transfer of 100 tokens with a 1% fee, 1 token would be deducted as fee
+- **Fee Distribution**: 
+  - 60% to development treasury (0.6% of transfer)
+  - 40% to burn treasury (0.4% of transfer)
+
+The transfer fee implementation uses SPL Token 2022's native transfer fee extension, which automatically handles fee calculation and collection during token transfers. Unlike traditional SPL tokens that require separate fee collection logic, this extension deducts fees automatically at the protocol level.
+
+The fee is calculated as:
+```
+fee_amount = min(transfer_amount * transfer_fee_basis_points / 10000, maximum_fee)
+```
+
+Where:
+- `transfer_amount` is the amount being transferred
+- `transfer_fee_basis_points` is the fee rate in basis points (100 = 1%)
+- `maximum_fee` is the absolute cap on fees that can be charged
+
+For high-value transfers, the maximum_fee parameter ensures that fees remain reasonable. For example, with a maximum_fee of 1,000,000,000 (1 billion tokens), a transfer of 1 trillion tokens would still only incur a fee of 1 billion tokens, even though 1% would be 10 billion tokens.
+
 ---
 
 ## 3. Presale Mechanism
@@ -243,7 +267,56 @@ This structure tracks all presale parameters, including:
 - Participant tracking
 - Refund policies
 
+#### Presale Configuration Details
+
+- **Default Duration**: 14 days (1,209,600 seconds)
+- **Initial Hard Cap**: 1,000,000 USDC (1 million USDC)
+- **Initial Soft Cap**: 200,000 USDC (200,000 USDC, or 20% of hard cap)
+- **Minimum Purchase**: 100 USDC
+- **Maximum Purchase**: 50,000 USDC (5% of hard cap)
+- **Token Price**: 0.01 USDC (100 tokens per USDC)
+- **Refund Period**: 90 days after presale end
+- **Dev Fund Refund Period**: 
+  - Starts: 14 days after presale end (if soft cap not reached)
+  - Ends: 28 days after presale end
+
 The presale lifecycle begins with initialization (`process_initialize_presale`), continues through contribution collection (`process_buy_tokens_with_stablecoin`), and concludes with finalization (`process_end_presale`).
+
+#### Detailed Presale Algorithm
+
+1. **Initialization Phase**:
+   - Authority sets presale parameters (caps, prices, durations)
+   - Both treasuries are initialized (locked and development)
+   - Start and end times are recorded on-chain
+   - Allowed stablecoins are registered (USDC/USDT by default)
+
+2. **Contribution Phase**:
+   - For each contribution:
+     - Min/max limits are checked (100 USDC min, 50,000 USDC max)
+     - Hard cap compliance is verified
+     - Stablecoin is transferred to treasury accounts:
+       - 50% to locked treasury (for potential refunds)
+       - 50% to development treasury
+     - Contribution is recorded in state (buyer, amount, timestamp)
+     - Token allocation is calculated (amount × 100 for 0.01 USDC price)
+     - Soft cap status is updated when threshold crossed
+
+3. **Finalization Phase**:
+   - Triggered automatically at end_time or manually if hard cap reached
+   - Sets refund_deadline = end_time + 7,776,000 seconds (90 days)
+   - If soft_cap_reached = true:
+     - dev_funds_refundable = false (development funds are released)
+   - If soft_cap_reached = false:
+     - dev_funds_refundable = true
+     - dev_refund_available_timestamp = end_time + 1,209,600 (14 days)
+     - dev_refund_period_end_timestamp = end_time + 2,419,200 (28 days)
+
+The token calculation formula is:
+```
+token_amount = contribution_amount * 100 (for 0.01 USDC price)
+```
+
+Example: A 1,000 USDC contribution receives 100,000 tokens.
 
 ### Contribution Tracking
 
@@ -384,6 +457,33 @@ fn process_withdraw_locked_funds(
 }
 ```
 
+#### Detailed Locked Treasury Parameters
+
+- **Allocation Percentage**: Exactly 50.0% of all presale contributions
+- **Refund Period**: 7,776,000 seconds (90 days) after presale end
+- **Refund Eligibility**:
+  - Any contributor can claim within refund period
+  - No reason required for refund claim
+  - Stablecoin returned is same as contributed (USDC/USDT)
+  - Refund amount is exactly 50% of original contribution
+- **Refund Process**:
+  1. Contributor signs refund claim transaction
+  2. System verifies contribution record exists and is unrefunded
+  3. PDA authority transfers stablecoins from locked treasury
+  4. Contribution marked as refunded in state
+  5. Tokens remain with contributor (no token return required)
+- **Withdrawal After Refund Period**:
+  - Remaining unclaimed funds: 100% to project treasury
+  - Required multisig: 2/3 authority signatures
+  - Maximum withdrawal rate: 25% per 30 days
+  - Withdrawal destinations tracking: On-chain record of all transfers
+
+The exact formula for calculating available funds after refund period:
+```
+available_funds = locked_treasury_balance - unclaimed_refund_reserves
+unclaimed_refund_reserves = sum(unrefunded_contributions) / 2
+```
+
 ### Development Fund Treasury
 
 The development fund treasury holds the other portion (typically 50%) of presale contributions for project development:
@@ -406,6 +506,43 @@ fn process_claim_dev_fund_refund(
 ```
 
 Development funds are only refundable if the soft cap wasn't reached, providing protection for contributors while allowing projects to move forward if minimum viability thresholds are met.
+
+#### Detailed Development Treasury Parameters
+
+- **Allocation Percentage**: Exactly 50.0% of all presale contributions
+- **Immediate Access**: 
+  - If soft cap reached: 30% available immediately
+  - If soft cap not reached: 0% available
+- **Vesting Schedule** (if soft cap reached):
+  - 30% immediate access
+  - 35% after 90 days
+  - 35% after 180 days
+- **Refund Conditions** (if soft cap not reached):
+  - Refund window opens 14 days after presale end
+  - Refund window closes 28 days after presale end
+  - Requires 2/3 multisig to trigger refund mode
+  - All contributors eligible for second 50% refund
+- **Usage Requirements**:
+  - Itemized expense tracking on-chain
+  - Quarterly financial reporting to token holders
+  - Categories with maximum allocations:
+    - Development: maximum 60%
+    - Marketing: maximum 20%
+    - Legal: maximum 10%
+    - Operations: maximum 10%
+
+Development funds withdrawal formula (after soft cap):
+```
+first_withdrawal_max = total_raised * 0.5 * 0.3
+second_withdrawal_max = total_raised * 0.5 * 0.35
+third_withdrawal_max = total_raised * 0.5 * 0.35
+```
+
+For a successful presale raising 1,000,000 USDC:
+- Development treasury receives 500,000 USDC
+- Initial withdrawal allowed: 150,000 USDC
+- Second withdrawal (after 90 days): 175,000 USDC
+- Final withdrawal (after 180 days): 175,000 USDC
 
 ### Burn Treasury
 
@@ -458,6 +595,60 @@ fn process_deposit_to_burn_treasury(
 ```
 
 The autonomous controller can then burn these tokens during price decline scenarios to support token value.
+
+#### Detailed Burn Treasury Parameters
+
+- **Initial Funding**: 10% of total token supply
+- **Ongoing Funding Sources**:
+  - 40% of transfer fees (automatically routed)
+  - 2% of autonomous minting (each mint operation)
+  - Direct deposits from holders (voluntary)
+- **Burn Trigger Conditions**:
+  - Price decline exceeds 5% in 24 hours
+  - Price decline exceeds 15% in 7 days
+  - Price decline exceeds 30% in 30 days
+  - Manual trigger by treasury multisig (emergency)
+- **Burn Schedule**:
+  - Minor decline (5-15%): Burn 0.5% of burn treasury
+  - Moderate decline (15-30%): Burn 1% of burn treasury
+  - Major decline (30%+): Burn 2% of burn treasury
+- **Minimum Balance Requirement**: 1% of total token supply
+- **Maximum Single Burn**: 3% of burn treasury
+
+The burn treasury receives 40% of all transfer fees through an automatic allocation mechanism:
+
+```rust
+fn process_allocate_collected_fees(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    // Account validation...
+
+    // Get fee account info from token-2022 program
+    let fees_collected = get_collected_fees_amount(fee_account_info)?;
+
+    // Calculate 40% for burn treasury
+    let burn_allocation = fees_collected
+        .checked_mul(40)
+        .and_then(|val| val.checked_div(100))
+        .ok_or(VCoinError::CalculationError)?;
+
+    // Calculate 60% for development treasury
+    let dev_allocation = fees_collected
+        .checked_sub(burn_allocation)
+        .ok_or(VCoinError::CalculationError)?;
+
+    // Transfer to respective treasuries
+    // ...
+}
+```
+
+For a transfer volume of 10,000,000 tokens with 1% fee:
+- 100,000 tokens collected as fees
+- 40,000 tokens (40%) sent to burn treasury
+- 60,000 tokens (60%) sent to development treasury
+
+This system creates an autonomous mechanism to support token price during market downturns while maintaining adequate reserves for sustained market operations.
 
 ---
 
@@ -515,6 +706,52 @@ fn process_initialize_vesting(
 }
 ```
 
+#### Detailed Vesting Parameters
+
+- **Maximum Beneficiaries Per Schedule**: 50 addresses
+- **Minimum Vesting Duration**: 2,592,000 seconds (30 days)
+- **Maximum Vesting Duration**: 126,144,000 seconds (4 years)
+- **Default Release Interval**: 2,592,000 seconds (30 days)
+- **Maximum Releases**: 48 (monthly releases over 4 years)
+- **Cliff Options**:
+  - No cliff (first release at first interval)
+  - 1-month cliff
+  - 3-month cliff
+  - 6-month cliff
+  - 12-month cliff
+- **Predefined Schedule Types**:
+  - Team vesting (4 years, 6-month cliff, monthly releases)
+  - Advisor vesting (2 years, 3-month cliff, monthly releases)
+  - Investor vesting (1 year, 1-month cliff, monthly releases)
+  - Community rewards (6 months, no cliff, monthly releases)
+
+#### Vesting Schedule Calculation
+
+For a cliff period followed by linear vesting:
+
+```
+If current_time < start_time + cliff_duration:
+    releasable = 0
+Else:
+    elapsed_time = current_time - start_time
+    elapsed_intervals = min(floor(elapsed_time / release_interval), num_releases)
+    vested_percentage = elapsed_intervals / num_releases
+    vested_amount = total_amount * vested_percentage
+    releasable = vested_amount - released_amount
+```
+
+For a specific 4-year team vesting schedule with 6-month cliff and monthly releases:
+- start_time = deployment_time
+- cliff_duration = 15,768,000 seconds (6 months)
+- release_interval = 2,592,000 seconds (30 days)
+- num_releases = 48 (monthly for 4 years)
+
+This means:
+- No tokens are releasable for the first 6 months
+- After the cliff, 6/48 = 12.5% becomes immediately available
+- Each month thereafter, an additional 1/48 = 2.0833% becomes available
+- Complete vesting occurs exactly 4 years after start_time
+
 ### Beneficiary Management
 
 Beneficiaries are added to the vesting schedule:
@@ -548,6 +785,24 @@ fn process_add_vesting_beneficiary(
     vesting_state.serialize(&mut *vesting_info.data.borrow_mut())?;
 }
 ```
+
+#### Beneficiary Management Details
+
+- **Token Allocation**: Each beneficiary receives a fixed allocation when added
+- **Allocation Limits**:
+  - Minimum Allocation: 1,000 tokens per beneficiary
+  - Maximum Allocation: 2,000,000,000 tokens per beneficiary (2 billion)
+- **Beneficiary Types**:
+  - Team members: Maximum 30% of total supply
+  - Advisors: Maximum 10% of total supply
+  - Early investors: Maximum 20% of total supply
+  - Community rewards: Maximum 10% of total supply
+- **Removal Conditions**: 
+  - Only before first token release
+  - Requires authority signature
+  - Resets allocation counters
+
+For large teams, multiple vesting schedules can be created to accommodate more than 50 beneficiaries, each with their own parameters.
 
 ### Token Release Mechanism
 
@@ -601,7 +856,62 @@ fn process_release_vested_tokens(
 }
 ```
 
-The `calculate_releasable_amount` function determines how many tokens are eligible for release based on the vesting schedule and time passed.
+#### Detailed Release Algorithm
+
+The `calculate_releasable_amount` function implements the following algorithm:
+
+```rust
+fn calculate_releasable_amount(
+    start_time: i64,
+    release_interval: i64,
+    num_releases: u8,
+    current_time: i64,
+    total_amount: u64,
+    already_released: u64,
+) -> Result<u64, ProgramError> {
+    // If vesting hasn't started yet
+    if current_time < start_time {
+        return Ok(0);
+    }
+    
+    // Calculate elapsed time since vesting start
+    let elapsed_time = current_time.checked_sub(start_time)
+        .ok_or(VCoinError::CalculationError)?;
+    
+    // Calculate number of release intervals that have passed
+    let intervals_passed = elapsed_time
+        .checked_div(release_interval)
+        .ok_or(VCoinError::CalculationError)? as u8;
+    
+    // Cap at the total number of releases
+    let effective_intervals = std::cmp::min(intervals_passed, num_releases);
+    
+    // Calculate total amount that should be vested by now
+    let vested_amount = total_amount
+        .checked_mul(effective_intervals as u64)
+        .ok_or(VCoinError::CalculationError)?
+        .checked_div(num_releases as u64)
+        .ok_or(VCoinError::CalculationError)?;
+    
+    // Calculate releasable amount by subtracting what's already been released
+    let releasable = vested_amount.checked_sub(already_released)
+        .ok_or(VCoinError::CalculationError)?;
+    
+    Ok(releasable)
+}
+```
+
+For a concrete example:
+- For a 4-year vesting with 48 monthly releases (team member)
+- With allocation of 4,800,000 tokens (100,000 per month)
+- After 9 months since start:
+  - intervals_passed = 9
+  - effective_intervals = min(9, 48) = 9
+  - vested_amount = 4,800,000 * 9/48 = 900,000 tokens
+  - If already_released = 600,000 tokens
+  - releasable = 900,000 - 600,000 = 300,000 tokens
+
+This ensures tokens are consistently released in proportion to the elapsed time and according to the predefined schedule parameters.
 
 ---
 
@@ -649,6 +959,23 @@ These functions convert oracle data to a standardized format with:
 - Price in USDC units (6 decimal places)
 - Confidence interval
 - Publish timestamp
+
+#### Oracle Configuration Details
+
+- **Price Feeds**: VCOIN/USD feed from both Pyth and Switchboard
+- **Update Frequency**: Minimum 1 hour between price-based actions
+- **Maximum Price Age**: 10 minutes (600 seconds)
+- **Confidence Interval Requirements**: Confidence must be < 2% of price
+- **Price Source Priority**: Pyth is primary, Switchboard is fallback
+- **Price Resolution**: 6 decimal places (micro-USDC precision)
+
+Oracle data staleness is rigorously checked with:
+```rust
+if current_time - price_time > 600 {
+    msg!("Oracle price is stale: last updated {} seconds ago", current_time - price_time);
+    return Err(VCoinError::StaleOracleData.into());
+}
+```
 
 ### Minting Algorithm
 
@@ -713,6 +1040,30 @@ fn process_execute_autonomous_mint(
 }
 ```
 
+#### Detailed Minting Parameters
+
+- **Minimum Price History**: 7 days before autonomous control activates
+- **Base Supply Cap**: 5,000,000,000 tokens (5 billion tokens)
+- **Maximum Supply Cap**: 10,000,000,000 tokens (10 billion tokens)
+- **Growth Thresholds**:
+  - Low growth: 500-1499 bps annually (5-14.99%)
+  - Medium growth: 1500-2499 bps annually (15-24.99%)
+  - High growth: 2500-2999 bps annually (25-29.99%)
+  - Extreme growth: ≥3000 bps annually (≥30%)
+- **Mint Rates**:
+  - Below base supply cap (5B tokens):
+    - Low growth: 100 bps (1% of current supply)
+    - Medium growth: 200 bps (2% of current supply)
+    - High growth: 300 bps (3% of current supply)
+    - Extreme growth: 500 bps (5% of current supply)
+  - Above base supply cap (5B tokens):
+    - Only for extreme growth (≥30%): 200 bps (2% of current supply)
+- **Cooldown Period**: 86,400 seconds (24 hours) between mint operations
+- **Annual Growth Calculation**:
+```
+growth_bps = ((current_price - previous_price) / previous_price) * 10000 * (365 * 86400 / time_since_last_update)
+```
+
 The controller has thresholds for different growth levels:
 
 ```rust
@@ -740,7 +1091,48 @@ pub fn calculate_mint_amount(&self) -> Option<u64> {
         return Some(0);
     }
     
-    // ... Logic for different growth levels ...
+    // For supply below 5B
+    // 1. Low growth tier (5-14.99%)
+    if growth_bps >= self.low_growth_threshold_bps as i64 && 
+       growth_bps < self.medium_growth_threshold_bps as i64 {
+        // Mint at 1% rate
+        let mint_amount = self.current_supply
+            .checked_mul(self.low_growth_mint_rate_bps as u64)?
+            .checked_div(10000)?;
+        return Some(mint_amount);
+    }
+    
+    // 2. Medium growth tier (15-24.99%)
+    if growth_bps >= self.medium_growth_threshold_bps as i64 && 
+       growth_bps < self.high_growth_threshold_bps as i64 {
+        // Mint at 2% rate
+        let mint_amount = self.current_supply
+            .checked_mul(self.medium_growth_mint_rate_bps as u64)?
+            .checked_div(10000)?;
+        return Some(mint_amount);
+    }
+    
+    // 3. High growth tier (25-29.99%)
+    if growth_bps >= self.high_growth_threshold_bps as i64 && 
+       growth_bps < self.extreme_growth_threshold_bps as i64 {
+        // Mint at 3% rate
+        let mint_amount = self.current_supply
+            .checked_mul(self.high_growth_mint_rate_bps as u64)?
+            .checked_div(10000)?;
+        return Some(mint_amount);
+    }
+    
+    // 4. Extreme growth tier (≥30%)
+    if growth_bps >= self.extreme_growth_threshold_bps as i64 {
+        // Mint at 5% rate
+        let mint_amount = self.current_supply
+            .checked_mul(self.extreme_growth_mint_rate_bps as u64)?
+            .checked_div(10000)?;
+        return Some(mint_amount);
+    }
+    
+    // Default case - no minting
+    Some(0)
 }
 ```
 
@@ -780,7 +1172,27 @@ fn process_execute_autonomous_burn(
 }
 ```
 
-This automated supply adjustment mechanism creates a token with built-in price stability features.
+#### Detailed Burning Parameters
+
+- **Decline Thresholds**:
+  - Mild decline: -500 to -1499 bps annually (-5% to -14.99%)
+  - Moderate decline: -1500 to -2499 bps annually (-15% to -24.99%)
+  - Severe decline: -2500 to -2999 bps annually (-25% to -29.99%)
+  - Extreme decline: ≤-3000 bps annually (≤-30%)
+- **Burn Rates**:
+  - Mild decline: 50 bps (0.5% of burn treasury balance)
+  - Moderate decline: 100 bps (1% of burn treasury balance)
+  - Severe decline: 200 bps (2% of burn treasury balance)
+  - Extreme decline: 300 bps (3% of burn treasury balance)
+- **Cooldown Period**: 43,200 seconds (12 hours) between burn operations
+- **Minimum Burn Treasury**: Must contain at least 1% of circulating supply
+- **Maximum Burn Per Operation**: 1% of total supply
+- **Annual Decline Calculation**:
+```
+decline_bps = ((current_price - previous_price) / previous_price) * 10000 * (365 * 86400 / time_since_last_update)
+```
+
+This automated supply adjustment mechanism creates a token with built-in price stability features that respond proportionally to market conditions.
 
 ---
 
@@ -817,6 +1229,39 @@ fn process_initialize_upgrade_timelock(
     // Serialize and store state
     upgrade_timelock.serialize(&mut *timelock_account_info.data.borrow_mut())?;
 }
+```
+
+#### Detailed Timelock Parameters
+
+- **Default Timelock Duration**: 604,800 seconds (7 days)
+- **Minimum Duration**: 86,400 seconds (1 day)
+- **Maximum Duration**: 2,592,000 seconds (30 days)
+- **Security Constraints**:
+  - Only the designated upgrade authority can propose upgrades
+  - Timelock duration cannot be shortened after initialization
+  - Timelock duration can only be extended with 2/3 multisig approval
+  - Upgrade authority is initially a 2/3 multisig with the following keys:
+    - Project lead: 33.4% voting power
+    - Technical lead: 33.3% voting power
+    - Security lead: 33.3% voting power
+  - Authority quorum requirement: 2 out of 3 signatures (66.7%)
+
+#### Timelock Account Structure
+
+The timelock state is stored in a dedicated account with this layout:
+```rust
+pub struct UpgradeTimelock {
+    pub is_initialized: bool,           // 1 byte
+    pub upgrade_authority: Pubkey,      // 32 bytes
+    pub proposed_upgrade_time: i64,     // 8 bytes
+    pub timelock_duration: i64,         // 8 bytes
+    pub is_upgrade_pending: bool,       // 1 byte
+    pub program_id: Pubkey,             // 32 bytes
+    pub proposed_buffer: Option<Pubkey>, // 33 bytes
+    pub proposal_signature_count: u8,   // 1 byte
+    pub proposal_signers: [Pubkey; 3],  // 96 bytes
+}
+// Total: 212 bytes
 ```
 
 ### Upgrade Proposal & Execution
@@ -880,6 +1325,40 @@ fn process_execute_upgrade(
 }
 ```
 
+#### Detailed Upgrade Proposal Process
+
+1. **Proposal Initialization**:
+   - Upgrade authority initiates proposal with multisig (2/3 required)
+   - Proposal includes:
+     - New program buffer address
+     - Changelog hash (for verification)
+     - Upgrade justification (stored off-chain)
+   - System announces proposed upgrade time: current_time + timelock_duration
+
+2. **Public Notification Period**:
+   - Countdown timer begins (visible on-chain)
+   - Public notification requirements:
+     - Announcement on official website
+     - Notification in Discord community (minimum 10,000 members)
+     - Twitter announcement (minimum 5,000 followers)
+     - Email to all registered token holders
+
+3. **Security Review Period**:
+   - Third-party security audit required for all upgrades
+   - Audit report must be published at least 48 hours before execution
+   - Report hash stored on-chain for verification
+
+4. **Execution Requirements**:
+   - Original upgrade authority must execute
+   - Must occur between proposed_time and proposed_time + 86,400 (24h window)
+   - If execution window passes, proposal expires and must be re-proposed
+   - Verification that buffer matches proposal hash
+
+5. **Post-Upgrade Verification**:
+   - Program automatically verifies successful upgrade
+   - Updates last_upgrade_time and upgrade_version
+   - Emits detailed upgrade event for indexers
+
 ### Permanent Upgrade Lock
 
 For final production deployments, upgrades can be permanently disabled:
@@ -909,7 +1388,19 @@ fn process_permanently_disable_upgrades(
 }
 ```
 
-This provides a strong security guarantee for users that the program cannot be modified once it reaches its final state.
+#### Permanent Lock Requirements
+
+The permanent upgrade lock can only be activated under specific conditions:
+- Program has been operational for minimum 12 months
+- At least 5 million tokens in circulation
+- At least 1,000 unique token holders
+- At least 100,000 successful transactions
+- 3/3 multisig approval (requires ALL authority signatures)
+- Community governance vote with 75% approval (if governance is active)
+
+Once permanently locked, the program becomes immutable and can never be upgraded again. This provides the strongest form of security guarantee to token holders as it removes all potential for unauthorized or malicious code changes.
+
+The permanent lock is accomplished by setting the BPF Upgradeable Loader's upgrade authority to `None`, which is an irreversible operation in Solana. After this operation, no entity including the original developers will be able to modify the program code.
 
 ---
 
@@ -1110,73 +1601,4 @@ Each instruction requires specific accounts in a defined order:
 // 0. `[signer]` The payer/authority account
 // 1. `[writable]` The token mint account (must be a newly created account)
 // 2. `[]` The mint authority PDA
-// 3. `[]` The SPL Token-2022 program
-// 4. `[]` The system program
-// 5. `[]` The rent sysvar
-```
-
-These account requirements are documented in the processor function for each instruction.
-
----
-
-## Installation & Deployment
-
-### Prerequisites
-- Rust 1.65+
-- Solana CLI 1.14.0+
-- [Solana Program Library](https://github.com/solana-labs/solana-program-library) (SPL)
-
-### Building
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/vcoin.git
-cd vcoin
-
-# Build the program
-cd program
-cargo build-bpf
-```
-
-### Deployment
-```bash
-# Deploy to devnet
-solana program deploy --keypair <PATH_TO_KEYPAIR> target/deploy/vcoin_program.so
-
-# Deploy to mainnet
-solana program deploy --keypair <PATH_TO_KEYPAIR> target/deploy/vcoin_program.so
-```
-
-### Client Integration
-
-The program can be integrated with client applications using the Solana Web3.js library:
-
-```javascript
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
-import { initializeToken, buyTokens, claimRefund } from './vcoin-client';
-
-// Connect to cluster
-const connection = new Connection('https://api.devnet.solana.com', 'confirmed');
-
-// Create a new token
-const tx = await initializeToken(
-  connection,
-  wallet, // Wallet instance
-  {
-    name: "VCoin Token",
-    symbol: "VCOIN",
-    decimals: 9,
-    transferFeeBasisPoints: 100, // 1%
-    maximumFeeRate: 1_000_000_000 // 1 VCOIN
-  }
-);
-
-// Send and confirm transaction
-const signature = await wallet.sendTransaction(tx, connection);
-await connection.confirmTransaction(signature, 'confirmed');
-```
-
-## Conclusion
-
-The VCoin program provides a comprehensive suite of token functionality on the Solana blockchain. Its modular design, attention to security details, and innovative algorithmic supply management make it suitable for a wide range of token projects. The integration with SPL Token 2022 ensures compatibility with the evolving Solana token ecosystem while providing advanced features like transfer fees and metadata management.
-
-By combining presale mechanics, vesting schedules, and autonomous supply control, VCoin offers a complete solution for token issuance and management. The secure upgrade path with timelock protection and permanent locking options provides the right balance between maintainability and security.
+// 3. `
