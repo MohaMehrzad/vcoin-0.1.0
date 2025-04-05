@@ -272,7 +272,7 @@ This structure tracks all presale parameters, including:
 - **Default Duration**: 14 days (1,209,600 seconds)
 - **Initial Hard Cap**: 1,000,000 USDC (1 million USDC)
 - **Initial Soft Cap**: 200,000 USDC (200,000 USDC, or 20% of hard cap)
-- **Minimum Purchase**: 100 USDC
+- **Minimum Purchase**: 10 USDC
 - **Maximum Purchase**: 50,000 USDC (5% of hard cap)
 - **Token Price**: 0.01 USDC (100 tokens per USDC)
 - **Refund Availability**:
@@ -292,7 +292,7 @@ The presale lifecycle begins with initialization (`process_initialize_presale`),
 
 2. **Contribution Phase**:
    - For each contribution:
-     - Min/max limits are checked (100 USDC min, 50,000 USDC max)
+     - Min/max limits are checked (10 USDC min, 50,000 USDC max)
      - Hard cap compliance is verified
      - Stablecoin is transferred to treasury accounts:
        - 50% to locked treasury (for potential refunds)
@@ -318,6 +318,8 @@ The presale lifecycle begins with initialization (`process_initialize_presale`),
    - After 3 months: Contributors can claim 50% refund from locked treasury
    - After 1 year: Contributors can claim 50% refund from dev treasury
    - Each refund window lasts for 30 days
+   - For all refunds, contributors must first return all tokens received
+   - Returned tokens are burned, removing them from circulation
 
 5. **Fund Withdrawal**:
    - Development treasury: Available for withdrawal at any time
@@ -434,6 +436,12 @@ fn process_claim_refund(
         return Err(VCoinError::RefundAlreadyClaimed.into());
     }
 
+    // Calculate token amount that must be returned
+    let token_amount = calculate_token_amount_for_contribution(contribution.amount, presale_state.token_price)?;
+    
+    // Verify the user has returned the tokens
+    // Check token account balance, verify token burn, etc.
+    
     // Calculate refund amount (50% in locked treasury)
     let refund_amount = contribution.amount
         .checked_div(2)
@@ -486,13 +494,18 @@ fn process_withdraw_locked_funds(
   - No reason required for refund claim
   - Stablecoin returned is same as contributed (USDC/USDT)
   - Refund amount is exactly 50% of original contribution
+- **Token Return Requirement**:
+  - Contributors must return all tokens received from their contribution
+  - Tokens are burned as part of the refund process
+  - No partial refunds - full token amount must be returned
 - **Refund Process**:
   1. Contributor signs refund claim transaction
   2. System verifies contribution record exists and is unrefunded
   3. System verifies soft cap was not reached
-  4. PDA authority transfers stablecoins from locked treasury
-  5. Contribution marked as refunded in state
-  6. Tokens remain with contributor (no token return required)
+  4. System verifies contributor has returned all tokens
+  5. Tokens are burned (removed from circulation)
+  6. PDA authority transfers stablecoins from locked treasury
+  7. Contribution marked as refunded in state
 
 ### Development Fund Treasury
 
@@ -549,6 +562,21 @@ fn process_claim_dev_fund_refund(
         msg!("Dev fund refunds will be available starting at {}", presale_state.dev_refund_available_timestamp);
         return Err(VCoinError::RefundUnavailable.into());
     }
+    
+    // Find the buyer's contribution
+    let (contribution_index, contribution) = match presale_state.find_contribution_by_stablecoin(buyer_info.key, stablecoin_mint_info.key) {
+        Some(result) => result,
+        None => {
+            msg!("No contribution found for this buyer with this stablecoin");
+            return Err(VCoinError::NoContribution.into());
+        }
+    };
+    
+    // Calculate token amount that must be returned
+    let token_amount = calculate_token_amount_for_contribution(contribution.amount, presale_state.token_price)?;
+    
+    // Verify the user has returned their tokens
+    // Check token account balance, verify token burn, etc.
 
     // Process refund logic...
 }
@@ -567,6 +595,7 @@ fn process_claim_dev_fund_refund(
   - Refund window opens 1 year after token launch
   - Refund window closes 30 days after opening
   - All contributors eligible for second 50% refund
+  - Must return all tokens to claim refund
 - **Usage Requirements**:
   - No on-chain restrictions on fund usage
   - Project team has full discretion over development fund allocation
