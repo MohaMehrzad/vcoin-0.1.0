@@ -10,6 +10,7 @@
 2. [Token Fundamentals](#token-fundamentals)
    - [SPL Token 2022 Integration](#spl-token-2022-integration)
    - [Token Mint Structure](#token-mint-structure)
+   - [Token Allocation](#token-allocation)
    - [Transfer Fee Implementation](#transfer-fee-implementation)
 
 3. [Presale Mechanism](#presale-mechanism)
@@ -159,6 +160,29 @@ fn process_initialize_token(
 ```
 
 The mint authority is a PDA (Program Derived Address) controlled by the VCoin program. This enables secure, programmatic control of supply without relying on externally owned key pairs.
+
+### Token Allocation
+
+VCoin has a total supply of 1 billion tokens (1,000,000,000) with the following allocation:
+
+- **ViWoApp Allocation**: 500,000,000 tokens (50% of total supply)
+  - Available after launching the ViWoApp
+  - Reserved for platform operations and growth
+
+- **Market Circulation**: 350,000,000 tokens (35% of total supply)
+  - Initial Release: 100,000,000 tokens released immediately after token launch
+  - Vested Release: 250,000,000 tokens released at a rate of 50,000,000 every 6 months
+  - Total vesting period: 30 months (2.5 years) until full market circulation is achieved
+
+- **Airdrop Allocation**: 50,000,000 tokens (5% of total supply)
+  - Available after token launch
+  - Designated for rewarding token buyers and ecosystem participants
+
+- **Presale Allocation**: 100,000,000 tokens (10% of total supply)
+  - Available when presale starts
+  - Distributed to early contributors in the presale phase
+
+This allocation structure ensures balanced token distribution while providing adequate liquidity for trading, rewards for community participation, and sustainable growth of the ViWoApp ecosystem.
 
 ### Transfer Fee Implementation
 
