@@ -319,7 +319,7 @@ The presale lifecycle begins with initialization (`process_initialize_presale`),
    - After 1 year: Contributors can claim 50% refund from dev treasury
    - Each refund window lasts for 30 days
    - For all refunds, contributors must first return all tokens received
-   - Returned tokens are burned, removing them from circulation
+   - Returned tokens are transferred to project treasury for future use
 
 5. **Fund Withdrawal**:
    - Development treasury: Available for withdrawal at any time
@@ -496,14 +496,14 @@ fn process_withdraw_locked_funds(
   - Refund amount is exactly 50% of original contribution
 - **Token Return Requirement**:
   - Contributors must return all tokens received from their contribution
-  - Tokens are burned as part of the refund process
+  - Returned tokens are transferred to a project treasury account for future use
   - No partial refunds - full token amount must be returned
 - **Refund Process**:
   1. Contributor signs refund claim transaction
   2. System verifies contribution record exists and is unrefunded
   3. System verifies soft cap was not reached
   4. System verifies contributor has returned all tokens
-  5. Tokens are burned (removed from circulation)
+  5. Tokens are transferred to project treasury
   6. PDA authority transfers stablecoins from locked treasury
   7. Contribution marked as refunded in state
 
@@ -595,7 +595,7 @@ fn process_claim_dev_fund_refund(
   - Refund window opens 1 year after token launch
   - Refund window closes 30 days after opening
   - All contributors eligible for second 50% refund
-  - Must return all tokens to claim refund
+  - Must return all tokens to project treasury to claim refund
 - **Usage Requirements**:
   - No on-chain restrictions on fund usage
   - Project team has full discretion over development fund allocation
