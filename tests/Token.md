@@ -205,8 +205,8 @@ Transfer fees are specified in basis points (1/100th of a percent) with a maximu
 - **Fee Cap**: 1,000,000,000 tokens (1 billion tokens)
 - **Fee Calculation**: For a transfer of 100 tokens with a 1% fee, 1 token would be deducted as fee
 - **Fee Distribution**: 
-  - 60% to development treasury (0.6% of transfer)
-  - 40% to burn treasury (0.4% of transfer)
+  - 100% to development treasury (1.0% of transfer)
+  - 0% to burn treasury (no automatic allocation)
 
 The transfer fee implementation uses SPL Token 2022's native transfer fee extension, which automatically handles fee calculation and collection during token transfers. Unlike traditional SPL tokens that require separate fee collection logic, this extension deducts fees automatically at the protocol level.
 
@@ -221,6 +221,8 @@ Where:
 - `maximum_fee` is the absolute cap on fees that can be charged
 
 For high-value transfers, the maximum_fee parameter ensures that fees remain reasonable. For example, with a maximum_fee of 1,000,000,000 (1 billion tokens), a transfer of 1 trillion tokens would still only incur a fee of 1 billion tokens, even though 1% would be 10 billion tokens.
+
+All transfer fees collected are directed to the development treasury fund where they can be used to support ongoing project development and operations.
 
 ---
 
@@ -666,7 +668,7 @@ The autonomous controller can then burn these tokens during price decline scenar
 
 - **Initial Funding**: 10% of total token supply
 - **Ongoing Funding Sources**:
-  - 40% of transfer fees (automatically routed)
+  - 0% of transfer fees (no automatic allocation)
   - 2% of autonomous minting (each mint operation)
   - Direct deposits from holders (voluntary)
 - **Burn Trigger Conditions**:
@@ -680,8 +682,13 @@ The autonomous controller can then burn these tokens during price decline scenar
   - Major decline (30%+): Burn 2% of burn treasury
 - **Minimum Balance Requirement**: 1% of total token supply
 - **Maximum Single Burn**: 3% of burn treasury
+- **Burn Restrictions**:
+  - Total token supply must never fall below 1 billion tokens
+  - Only tokens in burn treasury can be burned (never tokens held by buyers or investors)
+  - Each burn operation includes multiple safeguards to maintain minimum supply
+  - PDA verification ensures only authorized burn treasury tokens are affected
 
-The burn treasury receives 40% of all transfer fees through an automatic allocation mechanism:
+All transfer fees are directed to the development treasury through an automatic allocation mechanism:
 
 ```rust
 fn process_allocate_collected_fees(
@@ -693,28 +700,44 @@ fn process_allocate_collected_fees(
     // Get fee account info from token-2022 program
     let fees_collected = get_collected_fees_amount(fee_account_info)?;
 
-    // Calculate 40% for burn treasury
-    let burn_allocation = fees_collected
-        .checked_mul(40)
-        .and_then(|val| val.checked_div(100))
-        .ok_or(VCoinError::CalculationError)?;
+    // 100% goes to development treasury
+    let dev_allocation = fees_collected;
 
-    // Calculate 60% for development treasury
-    let dev_allocation = fees_collected
-        .checked_sub(burn_allocation)
-        .ok_or(VCoinError::CalculationError)?;
-
-    // Transfer to respective treasuries
+    // Transfer to development treasury
     // ...
 }
 ```
 
 For a transfer volume of 10,000,000 tokens with 1% fee:
 - 100,000 tokens collected as fees
-- 40,000 tokens (40%) sent to burn treasury
-- 60,000 tokens (60%) sent to development treasury
+- 100,000 tokens (100%) sent to development treasury
 
-This system creates an autonomous mechanism to support token price during market downturns while maintaining adequate reserves for sustained market operations.
+This system ensures all transaction fees are available for funding project development while still maintaining mechanisms to support token price during market downturns through controlled burning operations that protect token holders.
+
+The autonomous burn function includes multiple safeguards:
+1. Verifies burn source is the official burn treasury
+2. Checks if burning would reduce supply below the minimum threshold (1 billion tokens)
+3. Adjusts burn amount if necessary to maintain minimum supply
+4. Only burns tokens that are part of the burn treasury, never affecting user or investor wallets
+
+```rust
+// Verification that we're only burning from the burn treasury
+let expected_burn_treasury = Self::get_burn_treasury_address(mint_info.key);
+if *burn_treasury_token_account_info.key != expected_burn_treasury {
+    msg!("Invalid burn treasury account");
+    msg!("Burning can only target tokens in the official burn treasury");
+    return Err(VCoinError::InvalidBurnTreasury.into());
+}
+
+// Verification that we maintain minimum supply (1 billion tokens)
+if potential_new_supply < controller_state.min_supply {
+    msg!("Burning would reduce supply below the minimum threshold");
+    msg!("Adjusting burn amount to maintain minimum supply");
+    // ... logic to adjust burn amount ...
+}
+```
+
+This automated supply adjustment mechanism creates a token with built-in price stability features that respond proportionally to market conditions.
 
 ---
 
