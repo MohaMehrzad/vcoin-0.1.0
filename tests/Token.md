@@ -275,12 +275,12 @@ This structure tracks all presale parameters, including:
 - **Minimum Purchase**: 100 USDC
 - **Maximum Purchase**: 50,000 USDC (5% of hard cap)
 - **Token Price**: 0.01 USDC (100 tokens per USDC)
-- **Refund Period**: 90 days after presale end
-- **Dev Fund Refund Period**: 
-  - Starts: 14 days after presale end (if soft cap not reached)
-  - Ends: 28 days after presale end
+- **Refund Availability**:
+  - Locked Treasury: 3 months after token launch (if soft cap not reached)
+  - Dev Treasury: 1 year after token launch (if soft cap not reached)
+- **Refund Duration**: 30 days for each refund window
 
-The presale lifecycle begins with initialization (`process_initialize_presale`), continues through contribution collection (`process_buy_tokens_with_stablecoin`), and concludes with finalization (`process_end_presale`).
+The presale lifecycle begins with initialization (`process_initialize_presale`), continues through contribution collection (`process_buy_tokens_with_stablecoin`), and concludes with finalization (`process_end_presale`) and token launch (`process_launch_token`).
 
 #### Detailed Presale Algorithm
 
@@ -296,27 +296,34 @@ The presale lifecycle begins with initialization (`process_initialize_presale`),
      - Hard cap compliance is verified
      - Stablecoin is transferred to treasury accounts:
        - 50% to locked treasury (for potential refunds)
-       - 50% to development treasury
+       - 50% to development treasury (immediately available)
      - Contribution is recorded in state (buyer, amount, timestamp)
      - Token allocation is calculated (amount × 100 for 0.01 USDC price)
-     - Soft cap status is updated when threshold crossed
+     - If soft cap is reached, system marks `soft_cap_reached = true`
+     - As soon as soft cap is reached, all treasury funds become available for withdrawal
 
-3. **Finalization Phase**:
-   - Triggered automatically at end_time or manually if hard cap reached
-   - Sets refund_deadline = end_time + 7,776,000 seconds (90 days)
-   - If soft_cap_reached = true:
-     - dev_funds_refundable = false (development funds are released)
-   - If soft_cap_reached = false:
-     - dev_funds_refundable = true
-     - dev_refund_available_timestamp = end_time + 1,209,600 (14 days)
-     - dev_refund_period_end_timestamp = end_time + 2,419,200 (28 days)
+3. **Token Launch Phase**:
+   - Triggered by `LaunchToken` instruction after presale ends
+   - Records launch timestamp for refund window calculations
+   - Sets up refund availability timestamps:
+     - Locked treasury refunds: launch_timestamp + 3 months
+     - Dev treasury refunds: launch_timestamp + 1 year
+   - If soft cap was reached:
+     - Sets `dev_funds_refundable = false` (no refunds available)
+   - If soft cap was NOT reached:
+     - Sets `dev_funds_refundable = true` (refunds will be available)
+     - Locked treasury funds reserved for refunds
 
-The token calculation formula is:
-```
-token_amount = contribution_amount * 100 (for 0.01 USDC price)
-```
+4. **Refund Phase** (if soft cap not reached):
+   - After 3 months: Contributors can claim 50% refund from locked treasury
+   - After 1 year: Contributors can claim 50% refund from dev treasury
+   - Each refund window lasts for 30 days
 
-Example: A 1,000 USDC contribution receives 100,000 tokens.
+5. **Fund Withdrawal**:
+   - Development treasury: Available for withdrawal at any time
+   - Locked treasury: Available only if soft cap was reached
+
+The soft cap serves as a key threshold that determines fund availability and refund eligibility. When reached, it signals sufficient market interest and releases all funds to the project team.
 
 ### Contribution Tracking
 
@@ -398,7 +405,7 @@ This enables projects to accept contributions in various stablecoins while maint
 
 ### Locked Treasury Implementation
 
-The locked treasury holds a portion (typically 50%) of presale contributions that can be refunded if the project doesn't meet expectations:
+The locked treasury holds a portion (typically 50%) of presale contributions that can be refunded if the project doesn't meet its minimum viability threshold:
 
 ```rust
 fn process_claim_refund(
@@ -406,6 +413,12 @@ fn process_claim_refund(
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     // Account validation...
+
+    // Check if soft cap was reached - refunds only available if soft cap was NOT reached
+    if presale_state.soft_cap_reached {
+        msg!("Refunds are not available because soft cap was reached");
+        return Err(VCoinError::DevFundsNotRefundable.into());
+    }
 
     // Find the buyer's contribution
     let (contribution_index, contribution) = match presale_state.find_contribution_by_stablecoin(buyer_info.key, stablecoin_mint_info.key) {
@@ -436,7 +449,7 @@ fn process_claim_refund(
 }
 ```
 
-After the refund period expires, remaining funds can be withdrawn:
+The project team can withdraw from the locked treasury only if the soft cap is reached:
 
 ```rust
 fn process_withdraw_locked_funds(
@@ -445,13 +458,14 @@ fn process_withdraw_locked_funds(
 ) -> ProgramResult {
     // Account validation...
 
-    // Verify refund period has ended
-    if current_time < presale_state.refund_deadline {
-        let time_left = presale_state.refund_deadline - current_time;
-        msg!("Refund period is still active. {} seconds left", time_left);
+    // Check if soft cap was reached - locked funds can only be withdrawn if soft cap was reached
+    if !presale_state.soft_cap_reached {
+        msg!("Locked funds cannot be withdrawn because soft cap was not reached");
+        msg!("These funds are reserved for potential refunds");
         return Err(VCoinError::RefundPeriodActive.into());
     }
 
+    // If soft cap is reached, no need to check refund period - funds are immediately available
     // Transfer remaining funds to destination
     // ...
 }
@@ -460,33 +474,61 @@ fn process_withdraw_locked_funds(
 #### Detailed Locked Treasury Parameters
 
 - **Allocation Percentage**: Exactly 50.0% of all presale contributions
-- **Refund Period**: 7,776,000 seconds (90 days) after presale end
+- **Fund Availability**:
+  - If soft cap IS reached: Immediately available to project team
+  - If soft cap NOT reached: Reserved for refunds
+- **Refund Period**: 
+  - Starts 3 months after token launch (if soft cap not reached)
+  - Lasts for 30 days
 - **Refund Eligibility**:
   - Any contributor can claim within refund period
+  - Only available if soft cap was NOT reached
   - No reason required for refund claim
   - Stablecoin returned is same as contributed (USDC/USDT)
   - Refund amount is exactly 50% of original contribution
 - **Refund Process**:
   1. Contributor signs refund claim transaction
   2. System verifies contribution record exists and is unrefunded
-  3. PDA authority transfers stablecoins from locked treasury
-  4. Contribution marked as refunded in state
-  5. Tokens remain with contributor (no token return required)
-- **Withdrawal After Refund Period**:
-  - Remaining unclaimed funds: 100% to project treasury
-  - Required multisig: 2/3 authority signatures
-  - Maximum withdrawal rate: 25% per 30 days
-  - Withdrawal destinations tracking: On-chain record of all transfers
-
-The exact formula for calculating available funds after refund period:
-```
-available_funds = locked_treasury_balance - unclaimed_refund_reserves
-unclaimed_refund_reserves = sum(unrefunded_contributions) / 2
-```
+  3. System verifies soft cap was not reached
+  4. PDA authority transfers stablecoins from locked treasury
+  5. Contribution marked as refunded in state
+  6. Tokens remain with contributor (no token return required)
 
 ### Development Fund Treasury
 
-The development fund treasury holds the other portion (typically 50%) of presale contributions for project development:
+The development fund treasury holds the other portion (typically 50%) of presale contributions for immediate project development:
+
+```rust
+fn process_withdraw_dev_funds(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    // Account validation...
+
+    // Verify authority is the presale authority
+    if presale_state.authority != *authority_info.key {
+        msg!("Only the presale authority can withdraw development funds");
+        return Err(VCoinError::Unauthorized.into());
+    }
+
+    // Get the amount to withdraw (full balance)
+    let withdraw_amount = token_account.amount;
+    
+    if withdraw_amount == 0 {
+        msg!("No funds to withdraw");
+        return Err(VCoinError::InsufficientFunds.into());
+    }
+
+    // Execute the transfer (authority is direct signer)
+    // ...
+
+    msg!("Successfully withdrew {} tokens from development treasury", withdraw_amount);
+    
+    Ok(())
+}
+```
+
+Development funds are always available for project development. However, if the soft cap isn't reached, they may also be refundable one year after token launch:
 
 ```rust
 fn process_claim_dev_fund_refund(
@@ -501,48 +543,43 @@ fn process_claim_dev_fund_refund(
         return Err(VCoinError::DevFundsNotRefundable.into());
     }
 
+    // Check if we're in the refund window
+    if _current_time < presale_state.dev_refund_available_timestamp {
+        msg!("Dev fund refund period has not started yet");
+        msg!("Dev fund refunds will be available starting at {}", presale_state.dev_refund_available_timestamp);
+        return Err(VCoinError::RefundUnavailable.into());
+    }
+
     // Process refund logic...
 }
 ```
 
-Development funds are only refundable if the soft cap wasn't reached, providing protection for contributors while allowing projects to move forward if minimum viability thresholds are met.
-
 #### Detailed Development Treasury Parameters
 
 - **Allocation Percentage**: Exactly 50.0% of all presale contributions
-- **Immediate Access**: 
-  - If soft cap reached: 30% available immediately
-  - If soft cap not reached: 0% available
-- **Vesting Schedule** (if soft cap reached):
-  - 30% immediate access
-  - 35% after 90 days
-  - 35% after 180 days
-- **Refund Conditions** (if soft cap not reached):
-  - Refund window opens 14 days after presale end
-  - Refund window closes 28 days after presale end
-  - Requires 2/3 multisig to trigger refund mode
+- **Fund Availability**:
+  - Immediate access for project development at any time
+  - No vesting schedule or time restrictions
+- **Withdrawal Control**: 
+  - Presale authority can withdraw any amount at any time
+  - No multisig requirement for standard withdrawals
+- **Refund Conditions** (only if soft cap NOT reached):
+  - Refund window opens 1 year after token launch
+  - Refund window closes 30 days after opening
   - All contributors eligible for second 50% refund
 - **Usage Requirements**:
-  - Itemized expense tracking on-chain
-  - Quarterly financial reporting to token holders
-  - Categories with maximum allocations:
-    - Development: maximum 60%
-    - Marketing: maximum 20%
-    - Legal: maximum 10%
-    - Operations: maximum 10%
-
-Development funds withdrawal formula (after soft cap):
-```
-first_withdrawal_max = total_raised * 0.5 * 0.3
-second_withdrawal_max = total_raised * 0.5 * 0.35
-third_withdrawal_max = total_raised * 0.5 * 0.35
-```
+  - No on-chain restrictions on fund usage
+  - Project team has full discretion over development fund allocation
 
 For a successful presale raising 1,000,000 USDC:
 - Development treasury receives 500,000 USDC
-- Initial withdrawal allowed: 150,000 USDC
-- Second withdrawal (after 90 days): 175,000 USDC
-- Final withdrawal (after 180 days): 175,000 USDC
+- All 500,000 USDC is available immediately for project use
+- No refunds available if soft cap is reached
+
+For an unsuccessful presale (soft cap not reached):
+- Development treasury still receives 50% of funds
+- Project can still use these funds for development
+- Contributors can claim their portion back after 1 year
 
 ### Burn Treasury
 
