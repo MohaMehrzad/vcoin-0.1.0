@@ -13,10 +13,10 @@ use crate::processor::Processor;
 entrypoint!(process_instruction);
 
 // Program entrypoint's implementation
-pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    instruction_data: &[u8],
+pub fn process_instruction<'info>(
+    program_id: &'info Pubkey,
+    accounts: &'info [AccountInfo<'info>],
+    instruction_data: &'info [u8],
 ) -> ProgramResult {
     msg!("VCoin Program entrypoint");
     

@@ -216,6 +216,34 @@ pub enum VCoinError {
     /// Token already launched
     #[error("Token has already been launched")]
     TokenAlreadyLaunched,
+
+    /// Insufficient oracle consensus
+    #[error("Insufficient oracle consensus")]
+    InsufficientOracleConsensus,
+
+    /// Circuit breaker active
+    #[error("Circuit breaker active")]
+    CircuitBreakerActive,
+
+    /// Excessive price change detected
+    #[error("Excessive price change detected")]
+    ExcessivePriceChangeDetected,
+
+    /// Invalid price oracle parameters
+    #[error("Invalid price oracle parameters")]
+    InvalidPriceOracleParams,
+
+    /// Oracle system in degraded mode
+    #[error("Oracle system in degraded mode")]
+    OracleSystemDegraded,
+
+    /// Oracle data not found
+    #[error("Oracle data not found")]
+    OracleDataNotFound,
+
+    /// No consensus between oracles
+    #[error("No consensus between oracles")]
+    NoOracleConsensus,
 }
 
 impl From<VCoinError> for ProgramError {

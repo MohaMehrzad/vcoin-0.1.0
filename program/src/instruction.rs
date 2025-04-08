@@ -6,6 +6,7 @@ use solana_program::{
 };
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use borsh::{BorshDeserialize, BorshSerialize, to_vec};
+use crate::state::OracleType;
 
 /// Instruction types supported by the program
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
@@ -77,6 +78,22 @@ pub enum VCoinInstruction {
     BuyTokensWithStablecoin {
         /// Amount in stablecoin token units
         amount: u64,
+    },
+    /// Buy tokens directly
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The buyer
+    /// 1. `[writable]` The presale state account
+    /// 2. `[writable]` The mint account
+    /// 3. `[writable]` The buyer's token account
+    /// 4. `[signer]` The authority that can mint tokens
+    /// 5. `[]` The token program (SPL Token-2022)
+    /// 6. `[]` The system program
+    /// 7. `[writable]` The treasury account
+    /// 8. `[]` The clock sysvar
+    BuyTokens {
+        /// Amount in USD (as u64 with 6 decimals precision)
+        amount_usd: u64,
     },
     /// Add supported stablecoin to presale
     /// 
@@ -283,44 +300,6 @@ pub enum VCoinInstruction {
         /// Additional number of buyers to allocate space for
         additional_buyers: u32,
     },
-    /// Initialize Upgrade Timelock
-    /// 
-    /// Accounts expected:
-    /// 0. `[signer]` The current upgrade authority
-    /// 1. `[writable]` The timelock state account (PDA)
-    /// 2. `[]` The program account for this program
-    /// 3. `[]` The program data account for this program
-    /// 4. `[]` The system program
-    /// 5. `[]` The BPF Upgradeable Loader program
-    InitializeUpgradeTimelock {
-        /// Timelock duration in seconds (default 7 days)
-        timelock_duration: i64,
-    },
-    /// Propose Program Upgrade
-    /// 
-    /// Accounts expected:
-    /// 0. `[signer]` The current upgrade authority
-    /// 1. `[writable]` The timelock state account (PDA)
-    /// 2. `[]` The program account for this program
-    /// 3. `[]` The program data account for this program
-    /// 4. `[]` The BPF Upgradeable Loader program
-    /// 5. `[]` The clock sysvar
-    ProposeUpgrade,
-    /// Execute Program Upgrade
-    /// 
-    /// Accounts expected:
-    /// 0. `[signer]` The current upgrade authority
-    /// 1. `[writable]` The timelock state account (PDA)
-    /// 2. `[writable]` The program account for this program
-    /// 3. `[writable]` The program data account for this program
-    /// 4. `[writable]` The buffer account containing the new program
-    /// 5. `[]` The BPF Upgradeable Loader program
-    /// 6. `[]` The clock sysvar
-    /// 7. `[]` Rent sysvar
-    ExecuteUpgrade {
-        /// Buffer account containing the new program
-        buffer: Pubkey,
-    },
     /// Claim Refund from Development Treasury
     /// 
     /// Accounts expected:
@@ -333,6 +312,129 @@ pub enum VCoinInstruction {
     /// 6. `[]` The stablecoin mint
     /// 7. `[]` The clock sysvar
     ClaimDevFundRefund,
+    /// Emergency Pause Program Operations
+    /// 
+    /// Allows authority to quickly pause critical functions during emergency
+    /// Accounts expected:
+    /// 0. `[signer]` The emergency authority
+    /// 1. `[writable]` The emergency state account
+    EmergencyPause {
+        /// Optional reason for the pause
+        reason: Option<String>,
+    },
+    
+    /// Emergency Resume Program Operations
+    /// 
+    /// Allows authority to resume program operations after emergency
+    /// Accounts expected:
+    /// 0. `[signer]` The emergency authority
+    /// 1. `[writable]` The emergency state account
+    EmergencyResume,
+    
+    /// Rescue Tokens
+    /// 
+    /// Emergency instruction to rescue stuck tokens from any account
+    /// Accounts expected:
+    /// 0. `[signer]` The emergency authority
+    /// 1. `[writable]` The source token account to rescue from
+    /// 2. `[writable]` The destination token account 
+    /// 3. `[]` Source account authority (PDA derived from program)
+    /// 4. `[]` The token program
+    /// 5. `[]` The mint account
+    RescueTokens {
+        /// Amount of tokens to rescue
+        amount: u64,
+    },
+    
+    /// Recover State
+    /// 
+    /// Emergency instruction to fix corrupted state
+    /// Accounts expected:
+    /// 0. `[signer]` The emergency authority
+    /// 1. `[writable]` The state account to recover
+    /// 2. `[]` The system program
+    RecoverState {
+        /// The type of state to recover
+        state_type: RecoveryStateType,
+    },
+    /// Initialize Multi-Oracle Controller
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The oracle controller account
+    /// 2. `[]` Rent sysvar
+    InitializeOracleController {
+        /// Asset ID for the oracle controller (e.g., "BTC/USD")
+        asset_id: String,
+        /// Minimum required oracles for consensus
+        min_required_oracles: u8,
+    },
+    
+    /// Add Oracle Source
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The oracle controller account
+    /// 2. `[]` The oracle account to add
+    AddOracleSource {
+        /// Type of oracle
+        oracle_type: OracleType,
+        /// Weight for consensus calculation (0-100)
+        weight: u8,
+        /// Maximum allowed price deviation percentage from consensus (in basis points)
+        max_deviation_bps: u16,
+        /// Maximum allowed staleness in seconds
+        max_staleness_seconds: u32,
+        /// Whether this is a required oracle
+        is_required: bool,
+    },
+    
+    /// Update Oracle Consensus
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The caller (can be any account, often a keeper)
+    /// 1. `[writable]` The oracle controller account
+    /// 2. `[]` Clock sysvar
+    /// 3+. `[]` The oracle accounts (variable number, passed as remaining accounts)
+    UpdateOracleConsensus,
+    
+    /// Set Emergency Price
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The oracle controller account
+    /// 2. `[]` Clock sysvar
+    SetEmergencyPrice {
+        /// Emergency price to set
+        emergency_price: u64,
+        /// Expiration time in seconds
+        expiration_seconds: u32,
+    },
+    
+    /// Clear Emergency Price
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The oracle controller account
+    ClearEmergencyPrice,
+    
+    /// Reset Circuit Breaker
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The oracle controller account
+    ResetCircuitBreaker,
+    
+    /// Update Price Directly
+    /// 
+    /// Accounts expected:
+    /// 0. `[signer]` The authority
+    /// 1. `[writable]` The controller state account
+    /// 2. `[]` The clock sysvar
+    UpdatePriceDirectly {
+        /// The new price value (with 6 decimals precision)
+        new_price: u64,
+    },
 }
 
 /// Parameters for initializing a token
@@ -421,6 +523,21 @@ pub struct InitializeVestingParams {
     pub release_interval: i64,
     /// Number of releases
     pub num_releases: u8,
+}
+
+/// Types of state that can be recovered in emergency
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub enum RecoveryStateType {
+    /// Presale state
+    Presale,
+    /// Vesting state 
+    Vesting,
+    /// Controller state
+    Controller,
+    /// Token metadata
+    TokenMetadata,
+    /// Emergency state
+    EmergencyState,
 }
 
 impl VCoinInstruction {
@@ -818,11 +935,11 @@ impl VCoinInstruction {
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new(depositor, true),                  // Depositor (signer)
-            AccountMeta::new(depositor_token_account, false),   // Depositor's token account
-            AccountMeta::new(burn_treasury_token_account, false), // Burn treasury token account
-            AccountMeta::new(controller_state_account, false),    // Controller state account
-            AccountMeta::new(mint, false),                        // Mint account
+            AccountMeta::new(*depositor, true),                  // Depositor (signer)
+            AccountMeta::new(*depositor_token_account, false),   // Depositor's token account
+            AccountMeta::new(*burn_treasury_token_account, false), // Burn treasury token account
+            AccountMeta::new(*controller_state_account, false),    // Controller state account
+            AccountMeta::new(*mint, false),                        // Mint account
             AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
         ];
 
@@ -845,10 +962,10 @@ impl VCoinInstruction {
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new(payer, true),                  // Payer (signer)
-            AccountMeta::new(controller_state_account, false),    // Controller state account
-            AccountMeta::new(mint, false),                        // Mint account
-            AccountMeta::new(burn_treasury_token_account, false), // Burn treasury token account
+            AccountMeta::new(*payer, true),                  // Payer (signer)
+            AccountMeta::new(*controller_state_account, false),    // Controller state account
+            AccountMeta::new(*mint, false),                        // Mint account
+            AccountMeta::new(*burn_treasury_token_account, false), // Burn treasury token account
             AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
             AccountMeta::new_readonly(system_program::id(), false), // System program
             AccountMeta::new_readonly(solana_program::sysvar::rent::id(), false), // Rent sysvar
@@ -887,26 +1004,29 @@ impl VCoinInstruction {
         })
     }
 
-    /// Creates a new InitializeUpgradeTimelock instruction
-    pub fn initialize_upgrade_timelock(
+    /// Creates a new ClaimDevFundRefund instruction
+    pub fn claim_dev_fund_refund(
         program_id: &Pubkey,
-        current_upgrade_authority: &Pubkey,
-        program_account: &Pubkey,
-        program_data_account: &Pubkey,
-        timelock_duration: i64,
+        buyer: &Pubkey,
+        presale: &Pubkey,
+        buyer_stablecoin_token_account: &Pubkey,
+        development_treasury_stablecoin_account: &Pubkey,
+        authority: &Pubkey,
+        stablecoin_token_program: &Pubkey,
+        stablecoin_mint: &Pubkey,
     ) -> Result<Instruction, std::io::Error> {
-        let instr = Self::InitializeUpgradeTimelock {
-            timelock_duration,
-        };
+        let instr = Self::ClaimDevFundRefund;
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
-            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
-            AccountMeta::new_readonly(*program_account, false),            // Program account
-            AccountMeta::new_readonly(*program_data_account, false),         // Program data account
-            AccountMeta::new_readonly(system_program::id(), false),            // System program
-            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
+            AccountMeta::new(*buyer, true),                  // Buyer (signer)
+            AccountMeta::new(*presale, false),               // Presale state account
+            AccountMeta::new(*buyer_stablecoin_token_account, false),   // Buyer's stablecoin token account (destination)
+            AccountMeta::new(*development_treasury_stablecoin_account, false),   // Development treasury stablecoin account (source)
+            AccountMeta::new(*authority, true),              // Authority (signer)
+            AccountMeta::new_readonly(*stablecoin_token_program, false),   // Stablecoin token program
+            AccountMeta::new_readonly(*stablecoin_mint, false),   // Stablecoin mint
+            AccountMeta::new_readonly(sysvar::clock::id(), false),  // Clock sysvar
         ];
 
         Ok(Instruction {
@@ -916,23 +1036,19 @@ impl VCoinInstruction {
         })
     }
 
-    /// Creates a new ProposeUpgrade instruction
-    pub fn propose_upgrade(
+    /// Creates a new EmergencyPause instruction
+    pub fn emergency_pause(
         program_id: &Pubkey,
-        current_upgrade_authority: &Pubkey,
-        program_account: &Pubkey,
-        program_data_account: &Pubkey,
+        reason: Option<String>,
     ) -> Result<Instruction, std::io::Error> {
-        let instr = Self::ProposeUpgrade;
+        let instr = Self::EmergencyPause {
+            reason,
+        };
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
-            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
-            AccountMeta::new_readonly(*program_account, false),            // Program account
-            AccountMeta::new_readonly(*program_data_account, false),         // Program data account
-            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
-            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
+            AccountMeta::new_readonly(Pubkey::default(), true), // Emergency authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Emergency state account
         ];
 
         Ok(Instruction {
@@ -942,30 +1058,243 @@ impl VCoinInstruction {
         })
     }
 
-    /// Creates a new ExecuteUpgrade instruction
-    pub fn execute_upgrade(
+    /// Creates a new EmergencyResume instruction
+    pub fn emergency_resume(
         program_id: &Pubkey,
-        current_upgrade_authority: &Pubkey,
-        program_account: &Pubkey,
-        program_data_account: &Pubkey,
-        buffer: &Pubkey,
     ) -> Result<Instruction, std::io::Error> {
-        let instr = Self::ExecuteUpgrade {
-            buffer: *buffer,
+        let instr = Self::EmergencyResume;
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::default(), true), // Emergency authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Emergency state account
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new RescueTokens instruction
+    pub fn rescue_tokens(
+        program_id: &Pubkey,
+        amount: u64,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::RescueTokens {
+            amount,
         };
         let data = to_vec(&instr)?;
 
         let accounts = vec![
-            AccountMeta::new_readonly(*current_upgrade_authority, true), // Current upgrade authority (signer)
-            AccountMeta::new(Pubkey::default(), false),          // Timelock state account (PDA)
-            AccountMeta::new(*program_account, false),            // Program account
-            AccountMeta::new(*program_data_account, false),         // Program data account
-            AccountMeta::new(*buffer, false),                        // Buffer account
-            AccountMeta::new_readonly(solana_program::bpf_loader::id(), false), // BPF Upgradeable Loader program
-            AccountMeta::new_readonly(sysvar::clock::id(), false), // Clock sysvar
-            AccountMeta::new_readonly(system_program::id(), false), // Rent sysvar
+            AccountMeta::new_readonly(Pubkey::default(), true), // Emergency authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // Source token account
+            AccountMeta::new(Pubkey::default(), false),          // Destination token account
+            AccountMeta::new_readonly(Pubkey::default(), false), // Source account authority (PDA derived from program)
+            AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false), // Token program
+            AccountMeta::new_readonly(Pubkey::default(), false), // Mint account
         ];
 
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates a new RecoverState instruction
+    pub fn recover_state(
+        program_id: &Pubkey,
+        state_type: RecoveryStateType,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::RecoverState {
+            state_type,
+        };
+        let data = to_vec(&instr)?;
+
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::default(), true), // Emergency authority (signer)
+            AccountMeta::new(Pubkey::default(), false),          // State account to recover
+            AccountMeta::new_readonly(system_program::id(), false), // System program
+        ];
+
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+
+    /// Creates InitializeOracleController instruction
+    pub fn initialize_oracle_controller(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+        asset_id: String,
+        min_required_oracles: u8,
+    ) -> Result<Instruction, std::io::Error> {
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*controller, false),
+            AccountMeta::new_readonly(sysvar::rent::id(), false),
+        ];
+        
+        let data = Self::InitializeOracleController {
+            asset_id,
+            min_required_oracles,
+        }.try_to_vec()?;
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates AddOracleSource instruction
+    pub fn add_oracle_source(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+        oracle: &Pubkey,
+        oracle_type: OracleType,
+        weight: u8,
+        max_deviation_bps: u16,
+        max_staleness_seconds: u32,
+        is_required: bool,
+    ) -> Result<Instruction, std::io::Error> {
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*controller, false),
+            AccountMeta::new_readonly(*oracle, false),
+        ];
+        
+        let data = Self::AddOracleSource {
+            oracle_type,
+            weight,
+            max_deviation_bps,
+            max_staleness_seconds,
+            is_required,
+        }.try_to_vec()?;
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates UpdateOracleConsensus instruction
+    pub fn update_oracle_consensus(
+        program_id: &Pubkey,
+        caller: &Pubkey,
+        controller: &Pubkey,
+        oracle_accounts: &[Pubkey],
+    ) -> Result<Instruction, std::io::Error> {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(*caller, true),
+            AccountMeta::new(*controller, false),
+            AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ];
+        
+        // Add oracle accounts
+        for oracle in oracle_accounts {
+            accounts.push(AccountMeta::new_readonly(*oracle, false));
+        }
+        
+        let data = Self::UpdateOracleConsensus.try_to_vec()?;
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates SetEmergencyPrice instruction
+    pub fn set_emergency_price(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+        emergency_price: u64,
+        expiration_seconds: u32,
+    ) -> Result<Instruction, std::io::Error> {
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*controller, false),
+            AccountMeta::new_readonly(sysvar::clock::id(), false),
+        ];
+        
+        let data = Self::SetEmergencyPrice {
+            emergency_price,
+            expiration_seconds,
+        }.try_to_vec()?;
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates ClearEmergencyPrice instruction
+    pub fn clear_emergency_price(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*controller, false),
+        ];
+        
+        let data = Self::ClearEmergencyPrice.try_to_vec()?;
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates ResetCircuitBreaker instruction
+    pub fn reset_circuit_breaker(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::ResetCircuitBreaker;
+        let data = to_vec(&instr)?;
+        
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true), // Authority (signer)
+            AccountMeta::new(*controller, false),        // Oracle controller
+        ];
+        
+        Ok(Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        })
+    }
+    
+    /// Creates UpdatePriceDirectly instruction
+    pub fn update_price_directly(
+        program_id: &Pubkey,
+        authority: &Pubkey,
+        controller: &Pubkey,
+        new_price: u64,
+    ) -> Result<Instruction, std::io::Error> {
+        let instr = Self::UpdatePriceDirectly { new_price };
+        let data = to_vec(&instr)?;
+        
+        let accounts = vec![
+            AccountMeta::new_readonly(*authority, true),        // Authority (signer)
+            AccountMeta::new(*controller, false),               // Controller state account
+            AccountMeta::new_readonly(sysvar::clock::ID, false), // Clock sysvar
+        ];
+        
         Ok(Instruction {
             program_id: *program_id,
             accounts,

@@ -8,6 +8,7 @@ pub mod state;
 // Re-export for convenience
 pub use instruction::*;
 pub use error::*;
+pub use instruction::RecoveryStateType;
 
 // Program ID - using a known valid ID format
 solana_program::declare_id!("9ZskGH6R3iVYPeQMf1XiANgDZQHNMUvZgAC8Xxxj7zae"); 

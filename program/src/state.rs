@@ -33,6 +33,23 @@ pub struct PresaleContribution {
     pub timestamp: i64,
 }
 
+/// Represents a supported stablecoin with additional metadata
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct SupportedStablecoin {
+    /// Stablecoin mint address
+    pub mint: Pubkey,
+    /// Stablecoin type
+    pub stablecoin_type: StablecoinType,
+    /// Whether this stablecoin is active
+    pub is_active: bool,
+    /// Timestamp when added
+    pub added_at: i64,
+    /// Custom name if provided
+    pub name: Option<String>,
+    /// Decimal places of the stablecoin
+    pub decimals: u8,
+}
+
 /// Presale state
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
 pub struct PresaleState {
@@ -154,17 +171,21 @@ impl PresaleState {
         self.contributions.iter().enumerate().find(|(_, contribution)| &contribution.buyer == buyer)
     }
     
-    /// Add allowed stablecoin
-    pub fn add_allowed_stablecoin(&mut self, stablecoin_mint: Pubkey) -> Result<(), ProgramError> {
-        if self.allowed_stablecoins.contains(&stablecoin_mint) {
+    /// Add allowed stablecoin with more metadata
+    pub fn add_stablecoin(&mut self, stablecoin: SupportedStablecoin) -> Result<(), ProgramError> {
+        // Check if already exists
+        if self.allowed_stablecoins.iter().any(|coin| coin == &stablecoin.mint) {
             return Err(ProgramError::InvalidArgument);
         }
         
+        // Enforce limit
         if self.allowed_stablecoins.len() >= 10 {
             return Err(ProgramError::InvalidArgument);
         }
         
-        self.allowed_stablecoins.push(stablecoin_mint);
+        // Add stablecoin
+        self.allowed_stablecoins.push(stablecoin.mint);
+        
         Ok(())
     }
     
@@ -173,16 +194,8 @@ impl PresaleState {
         self.allowed_stablecoins.contains(stablecoin_mint)
     }
     
-    /// Get stablecoin type
-    pub fn get_stablecoin_type(&self, stablecoin_mint: &Pubkey) -> Option<StablecoinType> {
-        // Known USDC addresses on Solana
-        const USDC_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-        const USDC_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
-        
-        // Known USDT addresses on Solana
-        const USDT_MAINNET: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-        const USDT_DEVNET: &str = "DAwBSXe6w9g37wdE2tCrFbho3QHKZi4PjuBytQCULap2";
-        
+    /// Get stablecoin type with fallback logic
+    pub fn get_stablecoin_type_dynamic(&self, stablecoin_mint: &Pubkey) -> Option<StablecoinType> {
         // First check if stablecoin is allowed
         if !self.is_stablecoin_allowed(stablecoin_mint) {
             return None;
@@ -191,20 +204,56 @@ impl PresaleState {
         // Get the mint string for comparison
         let mint_str = stablecoin_mint.to_string();
         
+        // Known USDC addresses across networks
+        let usdc_addresses = [
+            // Mainnet
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            // Devnet
+            "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+            // Testnet
+            "CpMah17kQEL2wqyMKt3mZBdTnZbkbfx4nqmQMFDP5vwp",
+        ];
+        
+        // Known USDT addresses across networks
+        let usdt_addresses = [
+            // Mainnet
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            // Devnet
+            "DAwBSXe6w9g37wdE2tCrFbho3QHKZi4PjuBytQCULap2",
+            // Testnet 
+            "BQcdHdAQW1hczDbBi9hiegXAR7A98Q9jx3X3iBBBDiq4",
+        ];
+        
         // Check if it's a known USDC address
-        if mint_str == USDC_MAINNET || 
-           mint_str == USDC_DEVNET {
+        if usdc_addresses.contains(&mint_str.as_str()) {
             return Some(StablecoinType::USDC);
         }
         
         // Check if it's a known USDT address
-        if mint_str == USDT_MAINNET || 
-           mint_str == USDT_DEVNET {
+        if usdt_addresses.contains(&mint_str.as_str()) {
             return Some(StablecoinType::USDT);
         }
         
-        // It's allowed but not a recognized type
+        // If not a known address, return OTHER type
         Some(StablecoinType::OTHER)
+    }
+    
+    /// Add a raw stablecoin Pubkey (compatibility method)
+    pub fn add_stablecoin_raw(&mut self, stablecoin_mint: Pubkey) -> Result<(), ProgramError> {
+        // Check if already exists
+        if self.allowed_stablecoins.iter().any(|coin| coin == &stablecoin_mint) {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        // Enforce limit
+        if self.allowed_stablecoins.len() >= 10 {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        // Add stablecoin
+        self.allowed_stablecoins.push(stablecoin_mint);
+        
+        Ok(())
     }
 }
 
@@ -217,6 +266,36 @@ pub struct VestingBeneficiary {
     pub total_amount: u64,
     /// Amount of tokens already released
     pub released_amount: u64,
+}
+
+impl VestingBeneficiary {
+    /// Calculate the amount of tokens that should be released based on current time
+    pub fn calculate_released_amount(&mut self, current_time: i64, release_interval: i64) -> Result<u64, ProgramError> {
+        // Calculate releasable amount based on elapsed time and release interval
+        let elapsed_intervals = if release_interval > 0 {
+            current_time / release_interval
+        } else {
+            return Err(ProgramError::InvalidArgument);
+        };
+        
+        // Calculate amount per interval
+        let total_intervals = release_interval as u64;
+        let amount_per_interval = self.total_amount.checked_div(total_intervals)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+            
+        // Calculate total releasable amount
+        let total_releasable = amount_per_interval.checked_mul(elapsed_intervals as u64)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+            
+        // Don't release more than total amount
+        let capped_releasable = std::cmp::min(total_releasable, self.total_amount);
+        
+        // Calculate unreleased amount
+        let unreleased = capped_releasable.checked_sub(self.released_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+            
+        Ok(unreleased)
+    }
 }
 
 /// Vesting state
@@ -272,6 +351,8 @@ pub struct TokenMetadata {
     pub symbol: String,
     /// URI for the token
     pub uri: String,
+    /// Last updated timestamp
+    pub last_updated_timestamp: i64,
 }
 
 impl TokenMetadata {
@@ -548,24 +629,487 @@ pub struct PurchaseRecord {
     pub timestamp: i64,
 }
 
-/// Program upgrade timelock
+/// Program upgrade states
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
-pub struct UpgradeTimelock {
-    /// Is initialized
-    pub is_initialized: bool,
-    /// Current upgrade authority
-    pub upgrade_authority: Pubkey,
-    /// Proposed upgrade time
-    pub proposed_upgrade_time: i64,
-    /// Upgrade timelock duration in seconds (default 7 days)
-    pub timelock_duration: i64,
-    /// Is upgrade pending
-    pub is_upgrade_pending: bool,
+pub enum UpgradeState {
+    /// No upgrade proposed
+    None,
+    /// Upgrade proposed, waiting for timelock
+    Proposed { proposal_time: i64 },
+    /// Upgrade executed
+    Executed { execution_time: i64 },
+    /// Upgrades disabled
+    Disabled,
 }
 
-impl UpgradeTimelock {
-    /// Get the size of the upgrade timelock account
-    pub fn get_size() -> usize {
-        std::mem::size_of::<Self>()
+/// Emergency program state
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct EmergencyState {
+    /// Is initialized
+    pub is_initialized: bool,
+    /// Authority with emergency powers
+    pub emergency_authority: Pubkey,
+    /// Main program authority (as backup)
+    pub program_authority: Pubkey,
+    /// Current emergency state
+    pub emergency_mode: EmergencyMode,
+    /// Timestamp when emergency mode was activated
+    pub emergency_activated_at: i64,
+    /// Reason for emergency if provided
+    pub emergency_reason: Option<String>,
+    /// List of previously paused functions for tracking
+    pub pause_history: Vec<PauseRecord>,
+}
+
+/// Emergency modes for the program
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub enum EmergencyMode {
+    /// Normal operations
+    Normal,
+    /// Paused operations (only recovery functions allowed)
+    Paused,
+    /// Critical failure mode (only specific recovery functions)
+    Critical,
+}
+
+/// Record of a pause event
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct PauseRecord {
+    /// Timestamp when pause occurred
+    pub paused_at: i64,
+    /// Timestamp when operations resumed (if applicable)
+    pub resumed_at: Option<i64>,
+    /// Reason for the pause if provided
+    pub reason: Option<String>,
+    /// Authority that initiated the pause
+    pub paused_by: Pubkey,
+}
+
+impl EmergencyState {
+    /// Create a new emergency state
+    pub fn new(emergency_authority: Pubkey, program_authority: Pubkey) -> Self {
+        Self {
+            is_initialized: true,
+            emergency_authority,
+            program_authority,
+            emergency_mode: EmergencyMode::Normal,
+            emergency_activated_at: 0,
+            emergency_reason: None,
+            pause_history: Vec::new(),
+        }
+    }
+    
+    /// Check if operations are paused
+    pub fn is_paused(&self) -> bool {
+        match self.emergency_mode {
+            EmergencyMode::Normal => false,
+            _ => true,
+        }
+    }
+    
+    /// Pause operations
+    pub fn pause(&mut self, authority: &Pubkey, reason: Option<String>, timestamp: i64) -> Result<(), ProgramError> {
+        // Verify authority
+        if authority != &self.emergency_authority && authority != &self.program_authority {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        // Set emergency mode
+        self.emergency_mode = EmergencyMode::Paused;
+        self.emergency_activated_at = timestamp;
+        self.emergency_reason = reason.clone();
+        
+        // Record pause event
+        self.pause_history.push(PauseRecord {
+            paused_at: timestamp,
+            resumed_at: None,
+            reason,
+            paused_by: *authority,
+        });
+        
+        Ok(())
+    }
+    
+    /// Resume operations
+    pub fn resume(&mut self, authority: &Pubkey, timestamp: i64) -> Result<(), ProgramError> {
+        // Verify authority
+        if authority != &self.emergency_authority && authority != &self.program_authority {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        // Set normal mode
+        self.emergency_mode = EmergencyMode::Normal;
+        
+        // Update the latest pause record if any
+        if let Some(last_record) = self.pause_history.last_mut() {
+            if last_record.resumed_at.is_none() {
+                last_record.resumed_at = Some(timestamp);
+            }
+        }
+        
+        // Clear emergency reason
+        self.emergency_reason = None;
+        
+        Ok(())
+    }
+    
+    /// Calculate required space for the emergency state
+    pub fn get_space(history_capacity: usize) -> usize {
+        // Base size excluding Vec<PauseRecord>
+        let base_size = std::mem::size_of::<Self>() - std::mem::size_of::<Vec<PauseRecord>>();
+        
+        // Add space for pause records
+        let record_size = std::mem::size_of::<PauseRecord>();
+        let history_size = record_size.checked_mul(history_capacity)
+            .expect("Calculation error in EmergencyState::get_space");
+        
+        base_size.checked_add(history_size)
+            .expect("Calculation error in EmergencyState::get_space")
+    }
+}
+
+/// Oracle types supported by the protocol
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub enum OracleType {
+    /// Pyth Network Oracle
+    Pyth,
+    /// Switchboard Oracle
+    Switchboard,
+    /// Chainlink Oracle (future support)
+    Chainlink,
+    /// Custom Oracle
+    Custom,
+}
+
+/// Oracle source configuration
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct OracleSource {
+    /// Oracle public key
+    pub pubkey: Pubkey,
+    /// Oracle type
+    pub oracle_type: OracleType,
+    /// Whether this oracle is active
+    pub is_active: bool,
+    /// Weight for consensus calculation (0-100)
+    pub weight: u8,
+    /// Maximum allowed price deviation percentage from consensus (in basis points)
+    pub max_deviation_bps: u16,
+    /// Maximum allowed staleness in seconds
+    pub max_staleness_seconds: u32,
+    /// Last valid price in USD (with 6 decimals precision)
+    pub last_valid_price: u64,
+    /// Last update timestamp
+    pub last_update_timestamp: i64,
+    /// Consecutive failures
+    pub consecutive_failures: u8,
+    /// Whether this is a required oracle (must be present for critical operations)
+    pub is_required: bool,
+}
+
+/// Oracle price data from multiple sources
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct OracleConsensusResult {
+    /// Final price in USD (with 6 decimals precision)
+    pub price: u64,
+    /// Confidence interval in USD (with 6 decimals precision)
+    pub confidence: u64,
+    /// Timestamp of the consensus
+    pub timestamp: i64,
+    /// Number of oracles that contributed to the consensus
+    pub contributing_oracles: u8,
+    /// Circuit breaker active
+    pub circuit_breaker_active: bool,
+    /// Reason for circuit breaker activation (if any)
+    pub circuit_breaker_reason: Option<String>,
+    /// Whether the price is based on fallback mechanism
+    pub is_fallback_price: bool,
+    /// Maximum deviation between oracles (in basis points)
+    pub max_deviation_bps: u16,
+}
+
+/// Oracle health status for monitoring
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct OracleHealthStatus {
+    /// Last health check timestamp
+    pub last_checked: i64,
+    /// Overall health score (0-100)
+    pub health_score: u8,
+    /// Number of active oracles
+    pub active_oracles: u8,
+    /// Number of available oracles
+    pub total_oracles: u8,
+    /// Whether the system is operating in degraded mode
+    pub is_degraded: bool,
+    /// Maximum staleness across all active oracles (in seconds)
+    pub max_staleness: u32,
+    /// Average price deviation between oracles (in basis points)
+    pub avg_deviation_bps: u16,
+}
+
+/// Multi-Oracle Controller for price feed management
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
+pub struct MultiOracleController {
+    /// Is initialized
+    pub is_initialized: bool,
+    /// Authority that can manage oracles
+    pub authority: Pubkey,
+    /// Asset ID this controller tracks (e.g., "BTC/USD")
+    pub asset_id: String,
+    /// Oracle sources
+    pub oracle_sources: Vec<OracleSource>,
+    /// Minimum required oracles for consensus
+    pub min_required_oracles: u8,
+    /// Whether circuit breaker is currently active
+    pub circuit_breaker_active: bool,
+    /// Circuit breaker activation timestamp
+    pub circuit_breaker_activated_at: i64,
+    /// Circuit breaker reason if active
+    pub circuit_breaker_reason: Option<String>,
+    /// Circuit breaker cool-down period in seconds
+    pub circuit_breaker_cooldown: u32,
+    /// Last valid consensus result
+    pub last_consensus: OracleConsensusResult,
+    /// Current health status
+    pub health: OracleHealthStatus,
+    /// Emergency manually set price (for extreme situations)
+    pub emergency_price: Option<u64>,
+    /// Timestamp when emergency price was set
+    pub emergency_price_timestamp: i64,
+    /// Emergency price expiration in seconds
+    pub emergency_price_expiration: u32,
+}
+
+impl MultiOracleController {
+    /// Calculate space needed for the MultiOracleController with the given number of oracle sources
+    pub fn get_size(oracle_sources_count: usize) -> usize {
+        // Base size excluding Vec<OracleSource>
+        let base_size = std::mem::size_of::<Self>() - std::mem::size_of::<Vec<OracleSource>>();
+        
+        // Add space for oracle sources
+        let source_size = std::mem::size_of::<OracleSource>();
+        let sources_size = source_size.checked_mul(oracle_sources_count)
+            .expect("Calculation error in MultiOracleController::get_size");
+        
+        base_size.checked_add(sources_size)
+            .expect("Calculation error in MultiOracleController::get_size")
+    }
+    
+    /// Create a new oracle controller
+    pub fn new(
+        authority: Pubkey, 
+        asset_id: String,
+        min_required_oracles: u8,
+    ) -> Self {
+        Self {
+            is_initialized: true,
+            authority,
+            asset_id,
+            oracle_sources: Vec::new(),
+            min_required_oracles,
+            circuit_breaker_active: false,
+            circuit_breaker_activated_at: 0,
+            circuit_breaker_reason: None,
+            circuit_breaker_cooldown: 3600, // 1 hour default
+            last_consensus: OracleConsensusResult {
+                price: 0,
+                confidence: 0,
+                timestamp: 0,
+                contributing_oracles: 0,
+                circuit_breaker_active: false,
+                circuit_breaker_reason: None,
+                is_fallback_price: false,
+                max_deviation_bps: 0,
+            },
+            health: OracleHealthStatus {
+                last_checked: 0,
+                health_score: 100, // Start with perfect health
+                active_oracles: 0,
+                total_oracles: 0,
+                is_degraded: false,
+                max_staleness: 0,
+                avg_deviation_bps: 0,
+            },
+            emergency_price: None,
+            emergency_price_timestamp: 0,
+            emergency_price_expiration: 86400, // 24 hours default
+        }
+    }
+    
+    /// Check if emergency price is valid
+    pub fn is_emergency_price_valid(&self, current_time: i64) -> bool {
+        if let Some(_) = self.emergency_price {
+            let expiration_time = self.emergency_price_timestamp
+                .checked_add(self.emergency_price_expiration as i64)
+                .unwrap_or(i64::MAX);
+            
+            current_time < expiration_time
+        } else {
+            false
+        }
+    }
+    
+    /// Get emergency price if valid
+    pub fn get_emergency_price(&self, current_time: i64) -> Option<u64> {
+        if self.is_emergency_price_valid(current_time) {
+            self.emergency_price
+        } else {
+            None
+        }
+    }
+    
+    /// Add a new oracle source
+    pub fn add_oracle_source(&mut self, oracle_source: OracleSource) -> Result<(), ProgramError> {
+        // Check if oracle already exists
+        if self.oracle_sources.iter().any(|source| source.pubkey == oracle_source.pubkey) {
+            return Err(ProgramError::InvalidArgument);
+        }
+        
+        // Add the oracle
+        self.oracle_sources.push(oracle_source);
+        
+        // Update health status
+        self.health.total_oracles = self.oracle_sources.len() as u8;
+        if self.oracle_sources.last().unwrap().is_active {
+            self.health.active_oracles += 1;
+        }
+        
+        Ok(())
+    }
+    
+    /// Update an existing oracle source
+    pub fn update_oracle_source(
+        &mut self, 
+        pubkey: &Pubkey, 
+        is_active: Option<bool>,
+        weight: Option<u8>,
+        max_deviation_bps: Option<u16>,
+        max_staleness_seconds: Option<u32>,
+        is_required: Option<bool>,
+    ) -> Result<(), ProgramError> {
+        // Find the oracle
+        let oracle_idx = self.oracle_sources.iter().position(|source| &source.pubkey == pubkey)
+            .ok_or(ProgramError::InvalidArgument)?;
+        
+        // Update fields if provided
+        if let Some(is_active) = is_active {
+            // Update active oracles count
+            if is_active != self.oracle_sources[oracle_idx].is_active {
+                if is_active {
+                    self.health.active_oracles += 1;
+                } else {
+                    self.health.active_oracles = self.health.active_oracles.saturating_sub(1);
+                }
+            }
+            self.oracle_sources[oracle_idx].is_active = is_active;
+        }
+        
+        if let Some(weight) = weight {
+            // Ensure weight is within range
+            if weight > 100 {
+                return Err(ProgramError::InvalidArgument);
+            }
+            self.oracle_sources[oracle_idx].weight = weight;
+        }
+        
+        if let Some(max_deviation_bps) = max_deviation_bps {
+            self.oracle_sources[oracle_idx].max_deviation_bps = max_deviation_bps;
+        }
+        
+        if let Some(max_staleness_seconds) = max_staleness_seconds {
+            self.oracle_sources[oracle_idx].max_staleness_seconds = max_staleness_seconds;
+        }
+        
+        if let Some(is_required) = is_required {
+            self.oracle_sources[oracle_idx].is_required = is_required;
+        }
+        
+        Ok(())
+    }
+    
+    /// Activate circuit breaker
+    pub fn activate_circuit_breaker(&mut self, reason: String, current_time: i64) {
+        self.circuit_breaker_active = true;
+        self.circuit_breaker_activated_at = current_time;
+        self.circuit_breaker_reason = Some(reason.clone());
+        
+        // Update last consensus
+        self.last_consensus.circuit_breaker_active = true;
+        self.last_consensus.circuit_breaker_reason = Some(reason);
+        
+        // Mark system as degraded
+        self.health.is_degraded = true;
+    }
+    
+    /// Deactivate circuit breaker
+    pub fn deactivate_circuit_breaker(&mut self) {
+        self.circuit_breaker_active = false;
+        self.circuit_breaker_reason = None;
+        
+        // Update last consensus
+        self.last_consensus.circuit_breaker_active = false;
+        self.last_consensus.circuit_breaker_reason = None;
+        
+        // Restore health if no other issues
+        if self.health.active_oracles >= self.min_required_oracles {
+            self.health.is_degraded = false;
+        }
+    }
+    
+    /// Check if circuit breaker cooldown period has passed
+    pub fn has_circuit_breaker_cooldown_passed(&self, current_time: i64) -> bool {
+        if !self.circuit_breaker_active {
+            return true;
+        }
+        
+        let cooldown_end = self.circuit_breaker_activated_at
+            .checked_add(self.circuit_breaker_cooldown as i64)
+            .unwrap_or(i64::MAX);
+        
+        current_time >= cooldown_end
+    }
+    
+    /// Record a new price from an oracle
+    pub fn record_oracle_price(
+        &mut self, 
+        oracle_pubkey: &Pubkey, 
+        price: u64, 
+        timestamp: i64,
+    ) -> Result<(), ProgramError> {
+        // Find the oracle
+        let oracle_idx = self.oracle_sources.iter().position(|source| &source.pubkey == oracle_pubkey)
+            .ok_or(ProgramError::InvalidArgument)?;
+        
+        // Update the price data
+        let oracle = &mut self.oracle_sources[oracle_idx];
+        oracle.last_valid_price = price;
+        oracle.last_update_timestamp = timestamp;
+        oracle.consecutive_failures = 0;
+        
+        Ok(())
+    }
+    
+    /// Record an oracle failure
+    pub fn record_oracle_failure(&mut self, oracle_pubkey: &Pubkey) -> Result<(), ProgramError> {
+        // Find the oracle
+        let oracle_idx = self.oracle_sources.iter().position(|source| &source.pubkey == oracle_pubkey)
+            .ok_or(ProgramError::InvalidArgument)?;
+        
+        // Update failure count
+        self.oracle_sources[oracle_idx].consecutive_failures += 1;
+        
+        // If too many consecutive failures, deactivate
+        if self.oracle_sources[oracle_idx].consecutive_failures >= 5 {
+            if self.oracle_sources[oracle_idx].is_active {
+                self.oracle_sources[oracle_idx].is_active = false;
+                self.health.active_oracles = self.health.active_oracles.saturating_sub(1);
+                
+                // Check if we're below minimum required oracles
+                if self.health.active_oracles < self.min_required_oracles {
+                    self.health.is_degraded = true;
+                }
+            }
+        }
+        
+        Ok(())
     }
 } 
