@@ -1,0 +1,174 @@
+name: Deploy to Hostinger VPS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build application
+        run: npm run build
+
+      - name: Create .env.production file
+        uses: SpicyPizza/create-envfile@v2.0
+        with:
+          envkey_NEXT_PUBLIC_PROGRAM_ID: "327kJg7RikAeKDz7ADbUJbo8Fbe38WAiBvZ9K9zmeb8E"
+          envkey_NEXT_PUBLIC_SOLANA_NETWORK: "devnet"
+          envkey_NEXT_PUBLIC_SOLANA_RPC_URL: "https://api.devnet.solana.com"
+          envkey_NEXT_PUBLIC_USDC_MINT: "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr"
+          envkey_NEXT_PUBLIC_USDT_MINT: "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr"
+          envkey_NEXT_PUBLIC_ADMIN_WALLETS: "9HjKdCsUBNjEsAgMTfUUPQfrveAiyptN9vhPGnfowLKo"
+          envkey_NEXT_PUBLIC_API_BASE_URL: "/api"
+          envkey_API_SECRET_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_NEXT_PUBLIC_API_CLIENT_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_ENABLE_API_AUTH: "true"
+          envkey_NEXT_PUBLIC_API_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_NEXT_PUBLIC_API_ACCESS_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_API_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_API_ACCESS_KEY: "8c76094f6d9f2792b0d95c89b715511765989e770290d905aa31688471fab21f"
+          envkey_ADMIN_PRIVATE_KEY: "5yYu8bQLaqnaWSnKSZ7au4HWBYvm2Jw2yrACHXEz7nb2aqnf9ENP73KYHhZ6rLwzN7hEN9w1TMy9aAV56Y6ZxyXT"
+          envkey_REDIS_URL: "redis://localhost:6379"
+          envkey_NEXT_PUBLIC_REDIS_URL: "redis://localhost:6379"
+          envkey_NEXT_PUBLIC_USE_REDIS: "true"
+          envkey_SERVER_PORT: "3001"
+          file_name: .env.production
+          fail_on_empty: false
+          
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "YOUR_PRIVATE_KEY_HERE" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 45.132.241.76 >> ~/.ssh/known_hosts
+          
+      - name: Deploy to VPS
+        run: |
+          ssh root@45.132.241.76 '
+            # Create directory if it doesn't exist
+            mkdir -p /var/www/viwoapp.org/build
+            
+            # Install required packages if not present
+            if ! command -v npm &> /dev/null; then
+              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+              apt install -y nodejs
+            fi
+            
+            if ! command -v pm2 &> /dev/null; then
+              npm install -g pm2
+            fi
+            
+            # Install Redis if not present
+            if ! command -v redis-server &> /dev/null; then
+              apt update
+              apt install -y redis-server
+              systemctl enable redis-server
+              systemctl start redis-server
+            fi
+            
+            # Deploy code
+            cd /var/www/viwoapp.org
+            
+            # Clone or pull repository
+            if [ -d "build/.git" ]; then
+              cd build
+              git pull
+            else
+              rm -rf build
+              git clone https://github.com/MohaMehrzad/viwo-launchpad build
+              cd build
+            fi
+            
+            # Install dependencies and build with legacy-peer-deps flag
+            npm ci --legacy-peer-deps
+            npm run build
+          '
+            
+      - name: Upload .env.production
+        run: scp -i ~/.ssh/id_ed25519 .env.production root@45.132.241.76:/var/www/viwoapp.org/build/
+      
+      - name: Configure services and Nginx
+        run: |
+          ssh -i ~/.ssh/id_ed25519 root@45.132.241.76 '
+            cd /var/www/viwoapp.org/build
+            
+            # Create PM2 ecosystem file
+            cat > ecosystem.config.js << '\''EOL'\''
+            module.exports = {
+              apps: [
+                {
+                  name: "viwo-next",
+                  script: "npm",
+                  args: "start",
+                  env: {
+                    NODE_ENV: "production",
+                    PORT: 3000
+                  }
+                },
+                {
+                  name: "viwo-server",
+                  script: "node",
+                  args: "server/start.js",
+                  env: {
+                    NODE_ENV: "production"
+                  }
+                }
+              ]
+            };
+            EOL
+            
+            # Start or restart PM2 processes
+            pm2 delete all || true
+            pm2 start ecosystem.config.js
+            pm2 save
+            pm2 startup
+            
+            # Create Nginx config
+            cat > /etc/nginx/sites-available/viwoapp.org << '\''EOL'\''
+            server {
+                listen 80;
+                server_name www.viwoapp.org viwoapp.org;
+                
+                location / {
+                    proxy_pass http://localhost:3000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection '\''upgrade'\'';
+                    proxy_set_header Host $host;
+                    proxy_cache_bypass $http_upgrade;
+                }
+                
+                location /api/storage {
+                    proxy_pass http://localhost:3001;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $host;
+                    proxy_cache_bypass $http_upgrade;
+                }
+            }
+            EOL
+             if [ ! -f /etc/letsencrypt/live/viwoapp.org/fullchain.pem ]; then
+            # Enable site and restart Nginx
+            ln -sf /etc/nginx/sites-available/viwoapp.org /etc/nginx/sites-enabled/
+            if ! command -v certbot &> /dev/null; then
+              apt install -y certbot python3-certbot-nginx
+            fi
+            nginx -t && systemctl restart nginx
+            
+            # Set up SSL if not already done
+            if [ ! -f /etc/letsencrypt/live/viwoapp.org/fullchain.pem ]; then
+              certbot --nginx -d viwoapp.org -d www.viwoapp.org --non-interactive --agree-tos --email admin@viwoapp.org
+            fi
+          '
